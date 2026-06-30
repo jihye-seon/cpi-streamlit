@@ -5,6 +5,7 @@ import datetime
 import sys
 import plotly.graph_objects as go
 import warnings
+import os  # 파일 존재 여부 확인용 추가
 
 # SARIMA 모델용 라이브러리
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -14,29 +15,35 @@ warnings.filterwarnings("ignore")
 # --- [1] 페이지 레이아웃 설정 ---
 st.set_page_config(page_title="CPI 대시보드", layout="wide")
 
-st.title("📊 한국 CPI 시뮬레이터 (재분류 반영)")
-st.markdown("변동성 품목과 기조적 품목을 새로 정의된 기준에 따라 분류하고 시뮬레이션을 진행합니다.")
+st.title("📊 한국 CPI 시뮬레이터 ")
+st.markdown("한국 근월 CPI 예측 및 향후 경로의 시뮬레이션을 진행합니다.")
 st.markdown("---")
 
 # ==========================================
-# 📂 [DATA LOADING] 엑셀 파일 업로드 인터페이스
+# 📂 [DATA LOADING] 내장형 엑셀 파일 자동 로드
 # ==========================================
-st.sidebar.header("📁 데이터 소스 로드")
-uploaded_file = st.sidebar.file_uploader("CPI 마스터 엑셀 파일을 업로드하세요", type=["xlsx"])
+st.sidebar.header("📁 데이터 소스 정보")
+
+# 💡 내장할 엑셀 파일명 지정 (app.py와 같은 폴더에 위치해야 합니다)
+EXCEL_FILENAME = "CPI data_202605_1.xlsx"
 
 @st.cache_data
-def process_uploaded_excel(file):
+def process_embedded_excel(file_path):
     try:
+        # 파일이 실제로 디렉토리에 존재하는지 검증
+        if not os.path.exists(file_path):
+            return None, None, None, []
+            
         # cpi_data 로드 (날짜 가공 및 인덱스 설정)
-        df_cpi = pd.read_excel(file, sheet_name="CPI_Data", header=0)
+        df_cpi = pd.read_excel(file_path, sheet_name="CPI_Data", header=0)
         df_cpi['Date'] = pd.to_datetime(df_cpi['Date'], errors='coerce')
         df_cpi = df_cpi.dropna(subset=['Date']).sort_values('Date')
         df_cpi.set_index('Date', inplace=True)
         
         # cpi_weights 로드 (딕셔너리 구조로 변환)
-        df_weights = pd.read_excel(file, sheet_name="CPI_Weights", header=0)
-        # 엑셀 양식에 맞게 컬럼명 매핑 (Column_Name / Weight 기준)
+        df_weights = pd.read_excel(file_path, sheet_name="CPI_Weights", header=0)
         weights = df_weights.set_index(df_weights.columns[0])[df_weights.columns[1]].to_dict()
+        
         core_component_items = []
         if len(df_weights.columns) > 2:
             core_flag_col = df_weights.columns[2]
@@ -46,24 +53,8 @@ def process_uploaded_excel(file):
                 if pd.notna(flag_value) and str(flag_value).strip() in {'1', '1.0', 'True', 'true'}:
                     core_component_items.append(item_name)
         
-        # -------------------------------------------------------------------------
-        # [핵심] 기조적 품목 내 '석유 외 공업제품' 계산 (가공식품 + 이외공업제품 가중합)
-        # -------------------------------------------------------------------------
-        w_processed = weights.get('가공식품', 0)
-        w_other_manufactured = weights.get('이외공업제품', 0)
-        w_total_ex_oil = w_processed + w_other_manufactured
-        
-        if w_total_ex_oil > 0:
-            df_cpi['석유 외 공업제품'] = (
-                (df_cpi['가공식품'] * w_processed) + (df_cpi['이외공업제품'] * w_other_manufactured)
-            ) / w_total_ex_oil
-        else:
-            df_cpi['석유 외 공업제품'] = df_cpi['이외공업제품'] # 방어 코드
-            
-        weights['석유 외 공업제품'] = w_total_ex_oil
-        
         # Oil_krw_Data 시트 로드
-        df_macro = pd.read_excel(file, sheet_name="Oil_krw_Data", header=0)
+        df_macro = pd.read_excel(file_path, sheet_name="Oil_krw_Data", header=0)
         df_macro['Date'] = pd.to_datetime(df_macro['Date'], errors='coerce')
         df_macro = df_macro.dropna(subset=['Date'])
         df_macro.set_index('Date', inplace=True)
@@ -73,18 +64,25 @@ def process_uploaded_excel(file):
         
         df_merged = df_cpi.join(df_macro, how='inner')
         return df_merged.sort_index(), weights, df_macro, core_component_items
+        
     except Exception as e:
         st.sidebar.error(f"엑셀 구조 파싱 실패: {e}")
         return None, None, None, []
 
-if uploaded_file is not None:
-    df_hist, cpi_weights, df_macro_raw, core_component_items = process_uploaded_excel(uploaded_file)
-else:
-    df_hist, cpi_weights, df_macro_raw, core_component_items = None, None, None, []
+# 유저 업로드 인터페이스 없이, 서버 내부의 엑셀 파일을 자동 호출
+df_hist, cpi_weights, df_macro_raw, core_component_items = process_embedded_excel(EXCEL_FILENAME)
 
+# 깃허브에 파일이 누락되었거나 로드에 실패했을 때의 안내 가드레일
 if df_hist is None:
-    st.info("💡 대시보드를 시작하려면 왼쪽 사이드바에서 엑셀 파일을 업로드해 주세요.")
+    st.error(f"⚠️ 서버에서 데이터 파일(`{EXCEL_FILENAME}`)을 불러오지 못했습니다.")
+    st.info("💡 **호스트 안내:** 깃허브 레포지토리에 엑셀 파일이 코드(`app.py`)와 같은 디렉토리에 정확히 업로드(Push)되어 있는지 확인해 주세요.")
     st.stop()
+else:
+    # 데이터 로드 완료 시 사이드바에 데이터 기준일 안내 메시지 출력
+    last_date = df_hist.index[-1].strftime('%Y-%m-%d')
+    st.sidebar.success(f"✅ 데이터 동기화 완료 (최신 기준일: {last_date})")
+
+
 
 # 주요 변수 선언
 last_date = df_hist.index[-1]
@@ -128,12 +126,24 @@ hist_mom_all = df_hist.pct_change() * 100
 # 새롭게 정의된 Tab2 분류 구성 품목 풀(Pool)
 # ------------------------------------------
 volatile_items = ['농축수산물', '석유제품']
-core_items = ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
-total_index_items = ['농축수산물', '석유제품', '석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
-all_display_items = ['총지수'] + volatile_items + ['가공식품', '이외공업제품'] + core_items
+# 가공식품과 이외공업제품은 분리 유지 (가공식품은 근원 제외, 이외공업제품은 근원 포함)
+core_items = ['이외공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+total_index_items = ['농축수산물', '석유제품', '가공식품', '이외공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+
+# Ensure display lists do not contain duplicate names (preserve order)
+def _unique_preserve(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+all_display_items = _unique_preserve(['총지수'] + volatile_items + ['가공식품', '이외공업제품'] + core_items)
 
 BEST_ORDERS = {
-    '석유 외 공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)},
+    '이외공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)},
     '전기수도가스': {'order': (0, 2, 1), 'seasonal_order': (1, 0, 1, 12)},
     '집세': {'order': (3, 1, 0), 'seasonal_order': (0, 0, 1, 12)},
     '공공서비스': {'order': (0, 1, 1), 'seasonal_order': (1, 0, 0, 12)},
@@ -212,18 +222,19 @@ def compute_tab2_pred_indices(last_row, rec_values, session_state, base_fx_value
     mom_petro = float(session_state.get('petro_val', 0.0))
     exchange_rate = float(session_state.get('fx_val', base_fx_value))
     fx_mom = ((exchange_rate - base_fx_value) / base_fx_value) * 100
-
-    mom_oil_ex = float(session_state.get('core_oil_ex_val', rec_values['석유 외 공업제품']))
+    mom_processed = float(session_state.get('processed_val', rec_values.get('가공식품', 0.0)))
+    mom_other_manufactured = float(session_state.get('other_manuf_val', rec_values.get('이외공업제품', 0.0)))
     mom_utility = float(session_state.get('utility_val', rec_values['전기수도가스']))
     mom_housing = float(session_state.get('housing_val', rec_values['집세']))
     mom_public = float(session_state.get('public_val', rec_values['공공서비스']))
     mom_personal = float(session_state.get('personal_val', rec_values['개인서비스']))
 
-    adjusted_oil_ex_mom = mom_oil_ex + (fx_mom * fx_to_core_manufactured_beta)
+    adjusted_other_mom = mom_other_manufactured + (fx_mom * fx_to_core_manufactured_beta)
     pred_mom_dict = {
         '농축수산물': mom_agri,
         '석유제품': mom_petro,
-        '석유 외 공업제품': adjusted_oil_ex_mom,
+        '가공식품': mom_processed,
+        '이외공업제품': adjusted_other_mom,
         '전기수도가스': mom_utility,
         '집세': mom_housing,
         '공공서비스': mom_public,
@@ -237,7 +248,7 @@ def compute_tab2_pred_indices(last_row, rec_values, session_state, base_fx_value
 
 
 def prepare_sarima_exog(df, item):
-    if item == '석유 외 공업제품':
+    if item == '이외공업제품':
         return df[['WTI', 'USDKRW']].copy()
     if item == '전기수도가스':
         exog = df[['WTI']].copy()
@@ -250,7 +261,7 @@ def prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=None):
     if forecast_macro_row is None:
         forecast_macro_row = df.iloc[-1]
 
-    if item == '석유 외 공업제품':
+    if item == '이외공업제품':
         forecast_vals = [
             float(forecast_macro_row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0)),
             float(forecast_macro_row.get('USDKRW', df['USDKRW'].iloc[-1] if 'USDKRW' in df.columns else 0.0))
@@ -314,8 +325,10 @@ def calculate_3yr_seasonal_avg(df_mom, target_m, target_items):
 # 사이드바 연산 구동
 with st.sidebar:
     with st.spinner("🤖 추세 알고리즘 연산 중..."):
-        sarima_preds = predict_items_with_sarima(df_hist, core_items, forecast_macro_row=macro_target_row)
-        seasonal_preds = calculate_3yr_seasonal_avg(hist_mom_all, target_month, core_items)
+        # Include '가공식품' in the precomputed defaults so Tab2 shows a default for it
+        sarima_target_items = [it for it in (core_items + ['가공식품']) if it in df_hist.columns]
+        sarima_preds = predict_items_with_sarima(df_hist, sarima_target_items, forecast_macro_row=macro_target_row)
+        seasonal_preds = calculate_3yr_seasonal_avg(hist_mom_all, target_month, sarima_target_items)
     st.success("✅ 연산 완료")
 
 # ==========================================
@@ -347,7 +360,8 @@ if "agri_val" not in st.session_state: st.session_state.agri_val = 0.0
 if "petro_val" not in st.session_state: st.session_state.petro_val = 0.0
 if "fx_val" not in st.session_state: st.session_state.fx_val = base_fx
 
-if "core_oil_ex_val" not in st.session_state: st.session_state.core_oil_ex_val = float(rec_values['석유 외 공업제품'])
+if "processed_val" not in st.session_state: st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
+if "other_manuf_val" not in st.session_state: st.session_state.other_manuf_val = float(rec_values.get('이외공업제품', 0.0))
 if "utility_val" not in st.session_state: st.session_state.utility_val = float(rec_values['전기수도가스'])
 if "housing_val" not in st.session_state: st.session_state.housing_val = float(rec_values['집세'])
 if "public_val" not in st.session_state: st.session_state.public_val = float(rec_values['공공서비스'])
@@ -361,7 +375,8 @@ if st.session_state.prev_model != current_model:
     st.session_state.agri_val = 0.0
     st.session_state.petro_val = 0.0
     st.session_state.fx_val = base_fx
-    st.session_state.core_oil_ex_val = float(rec_values['석유 외 공업제품'])
+    st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
+    st.session_state.other_manuf_val = float(rec_values.get('이외공업제품', 0.0))
     st.session_state.utility_val = float(rec_values['전기수도가스'])
     st.session_state.housing_val = float(rec_values['집세'])
     st.session_state.public_val = float(rec_values['공공서비스'])
@@ -449,7 +464,7 @@ with tab2:
     col_title, col_btn = st.columns([3, 1])
     with col_title:
         st.header(f"🔮 예측 대상: {target_date.strftime('%Y-%m')} ({target_month}월 물가)")
-        st.markdown(f"**변동성 품목:** 농축수산물, 석유제품 / **기조적 품목:** 석유 외 공업제품 등 5개 항목")
+        st.markdown(f"**변동성 품목:** 농축수산물, 석유제품 / **기조적 품목:** 이외공업제품 등 5개 항목")
     
     with col_btn:
         st.write("") 
@@ -458,7 +473,8 @@ with tab2:
             st.session_state.agri_val = 0.0
             st.session_state.petro_val = 0.0
             st.session_state.fx_val = base_fx
-            st.session_state.core_oil_ex_val = float(rec_values['석유 외 공업제품'])
+            st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
+            st.session_state.other_manuf_val = float(rec_values.get('이외공업제품', 0.0))
             st.session_state.utility_val = float(rec_values['전기수도가스'])
             st.session_state.housing_val = float(rec_values['집세'])
             st.session_state.public_val = float(rec_values['공공서비스'])
@@ -495,8 +511,10 @@ with tab2:
         st.subheader("📈 2. 기조적 추세 품목 예상치")
         st.markdown(f"*(초기값 세팅 기준: **{current_model}**)*")
         
-        mom_oil_ex = st.number_input(f"석유 외 공업제품 예상 (MoM %, 추천: {rec_values['석유 외 공업제품']:.3f}%)", step=0.001, format="%.3f", key="core_oil_ex_val")
-        st.caption(format_sarima_order('석유 외 공업제품'))
+        mom_processed = st.number_input(f"가공식품 예상 (MoM %, 추천: {rec_values.get('가공식품', 0.0):.3f}%)", step=0.001, format="%.3f", key="processed_val")
+        st.caption(format_sarima_order('가공식품'))
+        mom_other = st.number_input(f"이외공업제품 예상 (MoM %, 추천: {rec_values.get('이외공업제품', 0.0):.3f}%)", step=0.001, format="%.3f", key="other_manuf_val")
+        st.caption(format_sarima_order('이외공업제품'))
         mom_utility = st.number_input(f"전기수도가스 예상 (MoM %, 추천: {rec_values['전기수도가스']:.3f}%)", step=0.001, format="%.3f", key="utility_val")
         st.caption(format_sarima_order('전기수도가스'))
         mom_housing = st.number_input(f"집세 예상 (MoM %, 추천: {rec_values['집세']:.3f}%)", step=0.001, format="%.3f", key="housing_val")
@@ -510,7 +528,7 @@ with tab2:
     # 🧮 환율 효과 및 인덱스 예측 연산 시동
     # ------------------------------------------
     pred_indices, fx_mom = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
-    st.caption(f"📌 현재 기준: {current_model} / 핵심 추천값: 석유 외 공업제품 {rec_values['석유 외 공업제품']:.3f}%, 전기수도가스 {rec_values['전기수도가스']:.3f}%")
+    st.caption(f"📌 현재 기준: {current_model} / 핵심 추천값: 가공식품 {rec_values.get('가공식품', 0.0):.3f}%, 이외공업제품 {rec_values.get('이외공업제품', 0.0):.3f}%, 전기수도가스 {rec_values.get('전기수도가스', 0.0):.3f}%")
         
     # 가중치 합산 기반 총지수 도출
     # 가중치 정보가 cpi_weights 에 존재하므로 호출하여 계산
@@ -533,7 +551,7 @@ with tab2:
     core_component_items_resolved = resolve_core_component_items(
         core_component_items,
         set(df_hist.columns),
-        ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+        ['이외공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
     )
     core_component_weights = {item: float(cpi_weights.get(item, 0.0)) for item in core_component_items_resolved}
     core_weight_total = sum(core_component_weights.values())
@@ -703,7 +721,7 @@ with tab3:
     core_target_items = resolve_core_component_items(
         core_component_items,
         set(df_hist.columns),
-        ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+        ['이외공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
     )
     core_hist_series = get_core_history_series(df_hist)
     core_sim_indices_dict = {k: [last_row[k]] for k in core_target_items}
@@ -756,7 +774,8 @@ with tab3:
         float(st.session_state.get("agri_val", 0.0)),
         float(st.session_state.get("petro_val", 0.0)),
         float(st.session_state.get("fx_val", base_fx)),
-        float(st.session_state.get("core_oil_ex_val", rec_values['석유 외 공업제품'])),
+        float(st.session_state.get("processed_val", rec_values.get('가공식품', 0.0))),
+        float(st.session_state.get("other_manuf_val", rec_values.get('이외공업제품', 0.0))),
         float(st.session_state.get("utility_val", rec_values['전기수도가스'])),
         float(st.session_state.get("housing_val", rec_values['집세'])),
         float(st.session_state.get("public_val", rec_values['공공서비스'])),
