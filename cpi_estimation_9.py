@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
+import sys
 import plotly.graph_objects as go
 import warnings
 
@@ -36,8 +37,14 @@ def process_uploaded_excel(file):
         df_weights = pd.read_excel(file, sheet_name="CPI_Weights", header=0)
         # 엑셀 양식에 맞게 컬럼명 매핑 (Column_Name / Weight 기준)
         weights = df_weights.set_index(df_weights.columns[0])[df_weights.columns[1]].to_dict()
-        
-
+        core_component_items = []
+        if len(df_weights.columns) > 2:
+            core_flag_col = df_weights.columns[2]
+            for _, row in df_weights.iterrows():
+                item_name = row.iloc[0]
+                flag_value = row.iloc[2]
+                if pd.notna(flag_value) and str(flag_value).strip() in {'1', '1.0', 'True', 'true'}:
+                    core_component_items.append(item_name)
         
         # -------------------------------------------------------------------------
         # [핵심] 기조적 품목 내 '석유 외 공업제품' 계산 (가공식품 + 이외공업제품 가중합)
@@ -65,15 +72,15 @@ def process_uploaded_excel(file):
         df_macro = df_macro[macro_cols]
         
         df_merged = df_cpi.join(df_macro, how='inner')
-        return df_merged.sort_index(), weights
+        return df_merged.sort_index(), weights, df_macro, core_component_items
     except Exception as e:
         st.sidebar.error(f"엑셀 구조 파싱 실패: {e}")
-        return None, None
+        return None, None, None, []
 
 if uploaded_file is not None:
-    df_hist, cpi_weights = process_uploaded_excel(uploaded_file)
+    df_hist, cpi_weights, df_macro_raw, core_component_items = process_uploaded_excel(uploaded_file)
 else:
-    df_hist, cpi_weights = None, None
+    df_hist, cpi_weights, df_macro_raw, core_component_items = None, None, None, []
 
 if df_hist is None:
     st.info("💡 대시보드를 시작하려면 왼쪽 사이드바에서 엑셀 파일을 업로드해 주세요.")
@@ -85,13 +92,23 @@ last_row = df_hist.iloc[-1]
 target_date = last_date + pd.DateOffset(months=1)
 target_month = target_date.month 
 
+
+def get_macro_row_for_target(df_macro, target_dt):
+    if df_macro is None or df_macro.empty:
+        return None
+    target_dt = pd.Timestamp(target_dt)
+    if target_dt in df_macro.index:
+        return df_macro.loc[target_dt].astype(float)
+    return df_macro.iloc[-1].astype(float)
+
+macro_target_row = get_macro_row_for_target(df_macro_raw, target_date)
+
 if "weights" not in st.session_state:
-    # 예시: 엑셀에서 가중치 시트를 읽어와 딕셔너리로 만드는 기존 코드가 있다면 다음과 같이 session_state에 주입
     try:
-        # 가중치 파일이나 데이터프레임(df_weights)이 있다면 변환
-        # 주석을 풀고 기존 가중치 딕셔너리 변환 코드를 여기에 넣으세요.
-        st.session_state["weights"] = df_weights.set_index(df_weights.columns[0])[df_weights.columns[1]].to_dict()
-        
+        st.session_state["weights"] = cpi_weights if cpi_weights else {}
+    except Exception:
+        st.session_state["weights"] = {}
+
         # 만약 임시로 테스트 중이라면 기본값 방어막 형성 (총합 1000)
         #st.session_state["weights"] = {
         #    '농축수산물': 75.6, '공업제품': 333.8, '전기수도가스': 33.7,
@@ -112,25 +129,171 @@ hist_mom_all = df_hist.pct_change() * 100
 # ------------------------------------------
 volatile_items = ['농축수산물', '석유제품']
 core_items = ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+total_index_items = ['농축수산물', '석유제품', '석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
 all_display_items = ['총지수'] + volatile_items + ['가공식품', '이외공업제품'] + core_items
+
+BEST_ORDERS = {
+    '석유 외 공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)},
+    '전기수도가스': {'order': (0, 2, 1), 'seasonal_order': (1, 0, 1, 12)},
+    '집세': {'order': (3, 1, 0), 'seasonal_order': (0, 0, 1, 12)},
+    '공공서비스': {'order': (0, 1, 1), 'seasonal_order': (1, 0, 0, 12)},
+    '개인서비스': {'order': (0, 2, 1), 'seasonal_order': (1, 0, 1, 12)},
+    '가공식품': {'order': (0, 2, 1), 'seasonal_order': (1, 0, 0, 12)},
+    '이외공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)}
+}
+
+
+def get_sarima_order(item):
+    if item in BEST_ORDERS:
+        return BEST_ORDERS[item]['order'], BEST_ORDERS[item]['seasonal_order']
+    return (1, 1, 1), (1, 1, 0, 12)
+
+
+def format_sarima_order(item):
+    order, seasonal_order = get_sarima_order(item)
+    return f"적용 차수: order={order}, seasonal_order={seasonal_order}"
+
+
+def normalize_component_weights(weight_map, target_items):
+    normalized = {}
+    raw_values = {item: float(weight_map.get(item, 0.0)) for item in target_items}
+    raw_total = sum(raw_values.values())
+    if raw_total <= 0:
+        for item in target_items:
+            normalized[item] = 0.0
+        return normalized
+    for item in target_items:
+        normalized[item] = raw_values[item] * 1000.0 / raw_total
+    return normalized
+
+
+def resolve_core_component_items(candidate_items, available_columns, fallback_items):
+    resolved = [item for item in candidate_items if item in available_columns]
+    if resolved:
+        return resolved
+    return [item for item in fallback_items if item in available_columns]
+
+
+def compute_weighted_component_series(df, weight_map, target_items):
+    available_items = [item for item in target_items if item in df.columns]
+    if not available_items:
+        return pd.Series(index=df.index, dtype=float)
+    component_weights = {item: float(weight_map.get(item, 0.0)) for item in available_items}
+    total_weight = sum(component_weights.values())
+    if total_weight <= 0:
+        return pd.Series(index=df.index, dtype=float)
+    weighted = pd.Series(0.0, index=df.index, dtype=float)
+    for item in available_items:
+        weighted += df[item] * component_weights[item]
+    return weighted / total_weight
+
+
+def get_core_history_series(df):
+    if 'Core' in df.columns:
+        return pd.to_numeric(df['Core'], errors='coerce')
+    return pd.Series(index=df.index, dtype=float)
+
+
+def build_monthly_avg_growths(df_mom, target_items):
+    monthly_avg_growths = {}
+    for item in target_items:
+        monthly_avg_growths[item] = {}
+        for month in range(1, 13):
+            same_m_data = df_mom[df_mom.index.month == month]
+            recent_three = same_m_data[item].dropna().tail(3)
+            avg_mom = recent_three.mean() if not recent_three.empty else 0.0
+            monthly_avg_growths[item][month] = float(avg_mom) if not np.isnan(avg_mom) else 0.0
+    return monthly_avg_growths
+
+
+def compute_tab2_pred_indices(last_row, rec_values, session_state, base_fx_value):
+    fx_to_core_manufactured_beta = 0.03
+    mom_agri = float(session_state.get('agri_val', 0.0))
+    mom_petro = float(session_state.get('petro_val', 0.0))
+    exchange_rate = float(session_state.get('fx_val', base_fx_value))
+    fx_mom = ((exchange_rate - base_fx_value) / base_fx_value) * 100
+
+    mom_oil_ex = float(session_state.get('core_oil_ex_val', rec_values['석유 외 공업제품']))
+    mom_utility = float(session_state.get('utility_val', rec_values['전기수도가스']))
+    mom_housing = float(session_state.get('housing_val', rec_values['집세']))
+    mom_public = float(session_state.get('public_val', rec_values['공공서비스']))
+    mom_personal = float(session_state.get('personal_val', rec_values['개인서비스']))
+
+    adjusted_oil_ex_mom = mom_oil_ex + (fx_mom * fx_to_core_manufactured_beta)
+    pred_mom_dict = {
+        '농축수산물': mom_agri,
+        '석유제품': mom_petro,
+        '석유 외 공업제품': adjusted_oil_ex_mom,
+        '전기수도가스': mom_utility,
+        '집세': mom_housing,
+        '공공서비스': mom_public,
+        '개인서비스': mom_personal
+    }
+
+    pred_indices = {}
+    for item in pred_mom_dict.keys():
+        pred_indices[item] = last_row[item] * (1 + pred_mom_dict[item] / 100)
+    return pred_indices, fx_mom
+
+
+def prepare_sarima_exog(df, item):
+    if item == '석유 외 공업제품':
+        return df[['WTI', 'USDKRW']].copy()
+    if item == '전기수도가스':
+        exog = df[['WTI']].copy()
+        exog['WTI_lag1'] = exog['WTI'].shift(1)
+        return exog[['WTI_lag1']]
+    return None
+
+
+def prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=None):
+    if forecast_macro_row is None:
+        forecast_macro_row = df.iloc[-1]
+
+    if item == '석유 외 공업제품':
+        forecast_vals = [
+            float(forecast_macro_row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0)),
+            float(forecast_macro_row.get('USDKRW', df['USDKRW'].iloc[-1] if 'USDKRW' in df.columns else 0.0))
+        ]
+        return np.tile(forecast_vals, (steps, 1))
+    if item == '전기수도가스':
+        forecast_wti = float(forecast_macro_row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0))
+        return np.full((steps, 1), forecast_wti)
+    return None
 
 # ==========================================
 # 🔮 [💡 백엔드 1] SARIMA 모델 예측 함수 (기조적 품목 대상)
 # ==========================================
 @st.cache_data
-def predict_items_with_sarima(df, target_items):
+def predict_items_with_sarima(df, target_items, forecast_macro_row=None):
     sarima_results = {}
     for item in target_items:
-        series = df[item].dropna()
-        model = SARIMAX(series, 
-                        order=(1, 1, 1), 
-                        seasonal_order=(1, 1, 0, 12),
+        series = df[[item]].copy()
+        exog = prepare_sarima_exog(df, item)
+        if exog is not None:
+            combined = series.join(exog, how='inner').dropna()
+            endog = combined[item]
+            exog_train = combined.drop(columns=[item])
+        else:
+            endog = series[item].dropna()
+            exog_train = None
+
+        order, seasonal_order = get_sarima_order(item)
+        model = SARIMAX(endog,
+                        exog=exog_train,
+                        order=order,
+                        seasonal_order=seasonal_order,
                         enforce_stationarity=False,
                         enforce_invertibility=False)
         model_fit = model.fit(disp=False)
         
-        pred_index = model_fit.forecast(steps=1).iloc[0]
-        last_val = series.iloc[-1]
+        if exog_train is not None:
+            exog_forecast = prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=forecast_macro_row)
+            pred_index = model_fit.forecast(steps=1, exog=exog_forecast).iloc[0]
+        else:
+            pred_index = model_fit.forecast(steps=1).iloc[0]
+
+        last_val = endog.iloc[-1]
         pred_mom = ((pred_index - last_val) / last_val) * 100
         sarima_results[item] = float(pred_mom)
     return sarima_results
@@ -151,14 +314,17 @@ def calculate_3yr_seasonal_avg(df_mom, target_m, target_items):
 # 사이드바 연산 구동
 with st.sidebar:
     with st.spinner("🤖 추세 알고리즘 연산 중..."):
-        sarima_preds = predict_items_with_sarima(df_hist, core_items)
+        sarima_preds = predict_items_with_sarima(df_hist, core_items, forecast_macro_row=macro_target_row)
         seasonal_preds = calculate_3yr_seasonal_avg(hist_mom_all, target_month, core_items)
     st.success("✅ 연산 완료")
 
 # ==========================================
 # 🔄 세션 상태(Session State) 초기화 및 매핑
 # ==========================================
-base_fx = float(round(last_row['USDKRW'], 1))
+base_fx = float(round(
+    macro_target_row.get('USDKRW', last_row.get('USDKRW', 0.0)) if macro_target_row is not None else last_row.get('USDKRW', 0.0),
+    1
+))
 
 if "model_choice" not in st.session_state:
     st.session_state.model_choice = "🤖 SARIMA 모델"
@@ -192,18 +358,25 @@ if "prev_model" not in st.session_state:
     st.session_state.prev_model = current_model
 
 if st.session_state.prev_model != current_model:
+    st.session_state.agri_val = 0.0
+    st.session_state.petro_val = 0.0
+    st.session_state.fx_val = base_fx
     st.session_state.core_oil_ex_val = float(rec_values['석유 외 공업제품'])
     st.session_state.utility_val = float(rec_values['전기수도가스'])
     st.session_state.housing_val = float(rec_values['집세'])
     st.session_state.public_val = float(rec_values['공공서비스'])
     st.session_state.personal_val = float(rec_values['개인서비스'])
     st.session_state.prev_model = current_model
+    st.session_state["tab2_methodology"] = current_model
     st.rerun()
+
+if "tab2_methodology" not in st.session_state:
+    st.session_state["tab2_methodology"] = current_model
 
 # ==========================================
 # 🗂️ [UI] 메인 화면 탭 구성
 # ==========================================
-tab1, tab2, tab3 = st.tabs(["📜 과거 데이터 추이", "🔮 익월 CPI 추정", "📈 향후 1개년 경로 시뮬레이터"])
+tab1, tab2, tab3 = st.tabs(["📜 과거 데이터 추이", "🔮 근월 CPI 추정", "📈 향후 1개년 경로 시뮬레이터"])
 
 # ------------------------------------------
 # 📜 TAB 1: 과거 추이
@@ -270,7 +443,7 @@ with tab1:
 
 
 # ------------------------------------------
-# 🔮 TAB 2: 익월 CPI 추정 (변동성 / 기조적 재분류 적용)
+# 🔮 TAB 2: 근월 CPI 추정 (변동성 / 기조적 재분류 적용)
 # ------------------------------------------
 with tab2:
     col_title, col_btn = st.columns([3, 1])
@@ -302,7 +475,7 @@ with tab2:
         st.caption("🔗 [KAMIS 소매가격 확인](https://www.kamis.or.kr/customer/price/agricultureRetail/catalogue.do)")
         mom_agri = st.slider(
             "농축수산물 예상 등락률 (MoM %)", 
-            min_value=-5.0, max_value=5.0, step=0.1, key="agri_val",
+            min_value=-5.0, max_value=5.0, step=0.001, format="%.3f", key="agri_val",
             help=f"직전월 농축수산물 상승률(MoM)은 {last_agri_mom:.2f}% 이었습니다."
         )
         
@@ -310,11 +483,11 @@ with tab2:
         st.caption("🔗 [오피넷 국내유가동향 확인](https://www.opinet.co.kr/user/dopospdrg/dopOsPdrgSelect.do)")
         mom_petro = st.slider(
             "석유제품 예상 등락률 (MoM %)", 
-            min_value=-5.0, max_value=5.0, step=0.1, key="petro_val",
+            min_value=-5.0, max_value=5.0, step=0.001, format="%.3f", key="petro_val",
             help=f"직전월 석유제품 상승률(MoM)은 {last_petro_mom:.2f}% 이었습니다."
         )
         
-        exchange_rate = st.number_input("예상 원/달러 환율 (원)", step=5.0, key="fx_val")
+        exchange_rate = st.number_input("예상 원/달러 환율 (원)", step=0.01, format="%.3f", key="fx_val")
         fx_mom = ((exchange_rate - base_fx) / base_fx) * 100
         st.caption(f"💡 환율 변동률: 전월비 **{fx_mom:+.2f}%**")
 
@@ -322,65 +495,82 @@ with tab2:
         st.subheader("📈 2. 기조적 추세 품목 예상치")
         st.markdown(f"*(초기값 세팅 기준: **{current_model}**)*")
         
-        mom_oil_ex = st.number_input(f"석유 외 공업제품 예상 (MoM %, 추천: {rec_values['석유 외 공업제품']:.2f}%)", step=0.05, key="core_oil_ex_val")
-        mom_utility = st.number_input(f"전기수도가스 예상 (MoM %, 추천: {rec_values['전기수도가스']:.2f}%)", step=0.1, key="utility_val")
-        mom_housing = st.number_input(f"집세 예상 (MoM %, 추천: {rec_values['집세']:.2f}%)", step=0.01, key="housing_val")
-        mom_public = st.number_input(f"공공서비스 예상 (MoM %, 추천: {rec_values['공공서비스']:.2f}%)", step=0.1, key="public_val")
-        mom_personal = st.number_input(f"개인서비스 예상 (MoM %, 추천: {rec_values['개인서비스']:.2f}%)", step=0.05, key="personal_val")
+        mom_oil_ex = st.number_input(f"석유 외 공업제품 예상 (MoM %, 추천: {rec_values['석유 외 공업제품']:.3f}%)", step=0.001, format="%.3f", key="core_oil_ex_val")
+        st.caption(format_sarima_order('석유 외 공업제품'))
+        mom_utility = st.number_input(f"전기수도가스 예상 (MoM %, 추천: {rec_values['전기수도가스']:.3f}%)", step=0.001, format="%.3f", key="utility_val")
+        st.caption(format_sarima_order('전기수도가스'))
+        mom_housing = st.number_input(f"집세 예상 (MoM %, 추천: {rec_values['집세']:.3f}%)", step=0.001, format="%.3f", key="housing_val")
+        st.caption(format_sarima_order('집세'))
+        mom_public = st.number_input(f"공공서비스 예상 (MoM %, 추천: {rec_values['공공서비스']:.3f}%)", step=0.001, format="%.3f", key="public_val")
+        st.caption(format_sarima_order('공공서비스'))
+        mom_personal = st.number_input(f"개인서비스 예상 (MoM %, 추천: {rec_values['개인서비스']:.3f}%)", step=0.001, format="%.3f", key="personal_val")
+        st.caption(format_sarima_order('개인서비스'))
 
     # ------------------------------------------
     # 🧮 환율 효과 및 인덱스 예측 연산 시동
     # ------------------------------------------
-    fx_to_core_manufactured_beta = 0.03
-    adjusted_oil_ex_mom = mom_oil_ex + (fx_mom * fx_to_core_manufactured_beta)
-    
-    # 예측 반영용 MoM 딕셔너리 매핑
-    pred_mom_dict = {
-        '농축수산물': mom_agri,
-        '석유제품': mom_petro,
-        '석유 외 공업제품': adjusted_oil_ex_mom,
-        '전기수도가스': mom_utility,
-        '집세': mom_housing,
-        '공공서비스': mom_public,
-        '개인서비스': mom_personal
-    }
-    
-    # 각 최종 항목의 예상 지수 산출
-    pred_indices = {}
-    for item in pred_mom_dict.keys():
-        pred_indices[item] = last_row[item] * (1 + pred_mom_dict[item] / 100)
+    pred_indices, fx_mom = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
+    st.caption(f"📌 현재 기준: {current_model} / 핵심 추천값: 석유 외 공업제품 {rec_values['석유 외 공업제품']:.3f}%, 전기수도가스 {rec_values['전기수도가스']:.3f}%")
         
     # 가중치 합산 기반 총지수 도출
     # 가중치 정보가 cpi_weights 에 존재하므로 호출하여 계산
     w_sum = 0.0
     w_index_product = 0.0
     
-    final_calc_items = ['농축수산물', '석유제품', '석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
-    for item in final_calc_items:
-        w = cpi_weights.get(item, 0)
+    component_weights = normalize_component_weights(cpi_weights, total_index_items)
+    for item in total_index_items:
+        w = component_weights.get(item, 0.0)
         w_index_product += pred_indices[item] * w
         w_sum += w
 
     # 정규화된 총지수(Total) 예측치 복원
-    pred_total = w_index_product / w_sum if w_sum > 0 else last_row['총지수']
-    
-    # 전월비(MoM) 및 전년동월비(YoY) 계산
+    total_pred_index = w_index_product / w_sum if w_sum > 0 else last_row['총지수']
     hist_total_last = last_row['총지수']
-    total_mom = ((pred_total - hist_total_last) / hist_total_last) * 100
-    
+    total_mom_rate = ((total_pred_index - hist_total_last) / hist_total_last) * 100 if hist_total_last != 0 else 0.0
+    st.caption(f"💡 총지수 구성항목: {', '.join(total_index_items)}")
+    st.caption(f"💡 가중치 기준: {w_sum:.2f}/1000")
+
+    core_component_items_resolved = resolve_core_component_items(
+        core_component_items,
+        set(df_hist.columns),
+        ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+    )
+    core_component_weights = {item: float(cpi_weights.get(item, 0.0)) for item in core_component_items_resolved}
+    core_weight_total = sum(core_component_weights.values())
+    core_pred_index = 0.0
+    if core_weight_total > 0:
+        for item in core_component_items_resolved:
+            core_pred_index += pred_indices.get(item, last_row[item]) * core_component_weights[item]
+        core_pred_index = core_pred_index / core_weight_total
+    else:
+        core_pred_index = last_row['총지수']
+
+    core_hist_series = get_core_history_series(df_hist)
+    core_hist_last = core_hist_series.dropna().iloc[-1] if core_hist_series.dropna().size > 0 else last_row['총지수']
+    core_mom_rate = ((core_pred_index - core_hist_last) / core_hist_last) * 100 if core_hist_last != 0 else 0.0
+
     ly_date = pd.to_datetime(target_date) - pd.DateOffset(years=1)
     try:
         closest_ly_idx = df_hist.index[df_hist.index.get_indexer([ly_date], method='nearest')[0]]
         ly_total = df_hist.loc[closest_ly_idx, '총지수'] if '총지수' in df_hist.columns else df_hist.loc[closest_ly_idx, 'Total']
-        total_yoy = ((pred_total - ly_total) / ly_total) * 100
-    except:
-        total_yoy = total_mom * 12
+        total_yoy_rate = ((total_pred_index - ly_total) / ly_total) * 100 if ly_total != 0 else 0.0
+    except Exception:
+        total_yoy_rate = total_mom_rate * 12
+
+    try:
+        closest_core_ly_idx = core_hist_series.index[core_hist_series.index.get_indexer([ly_date], method='nearest')[0]]
+        ly_core_val = core_hist_series.loc[closest_core_ly_idx]
+        core_yoy_rate = ((core_pred_index - ly_core_val) / ly_core_val) * 100 if ly_core_val != 0 else 0.0
+    except Exception:
+        core_yoy_rate = core_mom_rate * 12
 
     st.markdown("---")
     st.subheader(f"📊 {target_date.strftime('%Y-%m')} 총지수 시뮬레이션 결과")
-    k1, k2 = st.columns(2)
-    k1.metric(label="🎯 예상 소비자물가 상승률 (MoM)", value=f"{total_mom:.2f} %")
-    k2.metric(label="📈 예상 소비자물가 상승률 (YoY)", value=f"{total_yoy:.2f} %")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(label="🎯 예상 소비자물가 상승률 (MoM)", value=f"{total_mom_rate:.3f} %")
+    k2.metric(label="📈 예상 소비자물가 상승률 (YoY)", value=f"{total_yoy_rate:.3f} %")
+    k3.metric(label="🎯 예상 근원소비자물가 상승률 (MoM)", value=f"{core_mom_rate:.3f} %")
+    k4.metric(label="📈 예상 근원소비자물가 상승률 (YoY)", value=f"{core_yoy_rate:.3f} %")
 
     # ------------------------------------------
     # 📉 예측 스냅샷 시각화 시각화 레이어
@@ -394,100 +584,187 @@ with tab2:
     fig_dashboard = go.Figure()
     if "원지수" in chart_view_mode:
         y_hist = hist_subset['총지수'].values
-        y_pred_line = [hist_subset['총지수'].iloc[-1], pred_total]
+        y_pred_line = [hist_subset['총지수'].iloc[-1], total_pred_index]
         y_title = "CPI 총지수"
     elif "MoM" in chart_view_mode:
         y_hist = df_hist_mom.loc[hist_subset.index].values
-        y_pred_line = [df_hist_mom.iloc[-1], total_mom]
+        y_pred_line = [df_hist_mom.iloc[-1], total_mom_rate]
         y_title = "전월비 상승률 (MoM %)"
     else:
         y_hist = df_hist_yoy.loc[hist_subset.index].values
-        y_pred_line = [df_hist_yoy.iloc[-1], total_yoy]
+        y_pred_line = [df_hist_yoy.iloc[-1], total_yoy_rate]
         y_title = "전년동월비 상승률 (YoY %)"
 
     fig_dashboard.add_trace(go.Scatter(x=hist_subset.index, y=y_hist, name='과거 확정치', mode='lines+markers', line=dict(color='#1f77b4', width=3)))
-    fig_dashboard.add_trace(go.Scatter(x=[hist_subset.index[-1], pd.to_datetime(target_date)], y=y_pred_line, name='익월 추정치', mode='lines+markers', line=dict(color='#e377c2', width=3, dash='dash')))
+    fig_dashboard.add_trace(go.Scatter(x=[hist_subset.index[-1], pd.to_datetime(target_date)], y=y_pred_line, name='근월 추정치', mode='lines+markers', line=dict(color='#e377c2', width=3, dash='dash')))
     fig_dashboard.update_layout(xaxis_title="연월", yaxis_title=y_title, hovermode="x unified", height=400, margin=dict(t=20, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig_dashboard, use_container_width=True)
+    
+    # Tab3에서 사용할 pred_indices를 session_state에 저장
+    st.session_state['pred_indices'] = pred_indices
 
+@st.cache_data
+def predict_all_items_sarima_mom_track(df, w_dict, forecast_macro_row=None):
+    sarima_mom_results = {}
+    for item in w_dict.keys():
+        if item not in df.columns:
+            continue
+        series = df[[item]].copy()
+        exog = prepare_sarima_exog(df, item)
+        if exog is not None:
+            combined = series.join(exog, how='inner').dropna()
+            endog = combined[item]
+            exog_train = combined.drop(columns=[item])
+        else:
+            endog = series[item].dropna()
+            exog_train = None
+        
+        if item in BEST_ORDERS:
+            p_order = BEST_ORDERS[item]['order']
+            s_order = BEST_ORDERS[item]['seasonal_order']
+        else:
+            p_order = (1, 1, 1)
+            s_order = (1, 1, 0, 12)
+            
+        try:
+            model = SARIMAX(endog, order=p_order, seasonal_order=s_order,
+                            exog=exog_train, enforce_stationarity=False, enforce_invertibility=False)
+            model_fit = model.fit(disp=False)
+            if exog_train is not None:
+                exog_forecast = prepare_sarima_forecast_exog(df, item, steps=12, forecast_macro_row=forecast_macro_row)
+                raw_pred = model_fit.forecast(steps=12, exog=exog_forecast)
+            else:
+                raw_pred = model_fit.forecast(steps=12)
+            raw_pred_series = [df[item].iloc[-1]] + list(raw_pred.values)
+            pct_chg = np.diff(raw_pred_series) / raw_pred_series[:-1] * 100
+            sarima_mom_results[item] = list(pct_chg)
+        except Exception:
+            sarima_mom_results[item] = [0.0] * 12
+    return sarima_mom_results
 
 with tab3:
     st.header(f"🔮 향후 1개년 경로 시뮬레이터 ({current_model})")
     st.markdown(f"본 시나리오는 상단에서 선택하신 **[{current_model}]**의 추정치를 바탕으로 향후 경로를 예측합니다.")
     st.markdown("---")
 
+    total_col = '총지수' if '총지수' in df_hist.columns else 'Total'
     
     future_dates = [target_date + pd.DateOffset(months=i) for i in range(12)]
     extended_dates = [df_hist.index[-1]] + future_dates
+    
+    # 탭2의 현재 사용자 조정값을 기준으로 최신 예측값 재계산
+    pred_indices, _ = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
 
-    # 캐시 함수 내부에 전역 weights가 직접 들어가지 않도록 인자(w_dict)로 명시적 전달
-    @st.cache_data
-    def predict_all_items_sarima_mom_track(df, w_dict):
-        sarima_mom_results = {}
-        for item in w_dict.keys():
-            if item not in df.columns:
-                continue
-            series = df[item].dropna()
-            model = SARIMAX(series, order=(1, 1, 1), seasonal_order=(1, 1, 0, 12),
-                            enforce_stationarity=False, enforce_invertibility=False)
-            model_fit = model.fit(disp=False)
-            raw_pred = model_fit.forecast(steps=12)
-            raw_pred_series = [df[item].iloc[-1]] + list(raw_pred.values)
-            pct_chg = np.diff(raw_pred_series) / raw_pred_series[:-1] * 100
-            sarima_mom_results[item] = list(pct_chg)
-        return sarima_mom_results
-
-    # 전역 변수 weights를 안전하게 인자로 주입
-    sarima_trends_mom = predict_all_items_sarima_mom_track(df_hist, weights)
+    # SARIMA 모델 실행
+    sarima_trends_mom = predict_all_items_sarima_mom_track(df_hist, weights, forecast_macro_row=macro_target_row)
 
     # 시뮬레이션 대상 항목 필터링 (weights의 키 중 실제 df_hist에 존재하는 항목만)
-    target_items = [item for item in weights.keys() if item in df_hist.columns]
+    target_items = [item for item in total_index_items if item in df_hist.columns]
 
     sim_indices_dict = {k: [last_row[k]] for k in target_items}
+    component_weights = normalize_component_weights(cpi_weights, target_items)
+    monthly_avg_growths = build_monthly_avg_growths(hist_mom_all, target_items)
+    st.caption(f"💡 7월 이후 경로는 직전 3개년 동월 평균 MoM과 가중치(총합 {sum(component_weights.values()):.2f}/1000) 기준으로 계산됩니다.")
+
     for i, f_date in enumerate(future_dates):
         f_month = f_date.month
         for item in target_items:
             if i == 0:
-                sim_indices_dict[item].append(pred_indices[item])
+                next_val = pred_indices.get(item, sim_indices_dict[item][-1])
             else:
                 if "SARIMA" in current_model:
-                    trend_mom = sarima_trends_mom[item][i]
+                    trend_mom = sarima_trends_mom.get(item, [0.0] * 12)[i - 1]
                 else:
-                    same_m_data = hist_mom_all[hist_mom_all.index.month == f_month]
-                    trend_mom = same_m_data[item].tail(3).mean()
-                    if np.isnan(trend_mom): trend_mom = 0.0
+                    trend_mom = monthly_avg_growths[item].get(f_month, 0.0)
                 next_val = sim_indices_dict[item][-1] * (1 + trend_mom / 100)
-                sim_indices_dict[item].append(next_val)
+            sim_indices_dict[item].append(next_val)
 
-    # 가중치 총합 계산 (일반적으로 1000)
-    total_weight = sum(weights[item] for item in target_items)
-
+    total_weight = sum(component_weights.get(item, 0.0) for item in target_items)
     hybrid_totals = []
     for step in range(1, 13):
-        w_sum = sum(sim_indices_dict[item][step] * weights[item] for item in target_items)
-        # 가중치 합이 1000이 아닐 경우를 대비해 total_weight로 나누어 원지수 스케일링(100 내외) 충족
-        hybrid_totals.append(w_sum / total_weight)
+        w_sum = sum(sim_indices_dict[item][step] * component_weights.get(item, 0.0) for item in target_items)
+        hybrid_totals.append(w_sum / total_weight if total_weight > 0 else last_row[total_col])
 
     df_path_base = pd.DataFrame(index=future_dates, data={"Total_Index": hybrid_totals})
-    base_indices_full = [last_row['Total']] + list(df_path_base["Total_Index"])
+    base_indices_full = [last_row[total_col]] + list(df_path_base["Total_Index"])
     df_path_base["MoM"] = np.diff(base_indices_full) / base_indices_full[:-1] * 100
     
     base_yoy = []
     for f_date in future_dates:
         ly_date = f_date - pd.DateOffset(years=1)
         if ly_date in df_hist.index:
-            ly_total_val = df_hist.loc[ly_date, 'Total']
+            ly_total_val = df_hist.loc[ly_date, total_col]
         else:
             closest_idx = df_hist.index[df_hist.index.get_indexer([ly_date], method='nearest')[0]]
-            ly_total_val = df_hist.loc[closest_idx, 'Total']
+            ly_total_val = df_hist.loc[closest_idx, total_col]
         base_yoy.append(((df_path_base.loc[f_date, "Total_Index"] - ly_total_val) / ly_total_val) * 100)
     df_path_base["YoY"] = base_yoy
+
+    core_target_items = resolve_core_component_items(
+        core_component_items,
+        set(df_hist.columns),
+        ['석유 외 공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
+    )
+    core_hist_series = get_core_history_series(df_hist)
+    core_sim_indices_dict = {k: [last_row[k]] for k in core_target_items}
+    core_component_weights = {item: float(cpi_weights.get(item, 0.0)) for item in core_target_items}
+    core_monthly_avg_growths = build_monthly_avg_growths(hist_mom_all, core_target_items)
+
+    for i, f_date in enumerate(future_dates):
+        f_month = f_date.month
+        for item in core_target_items:
+            if i == 0:
+                next_val = pred_indices.get(item, core_sim_indices_dict[item][-1])
+            else:
+                if "SARIMA" in current_model:
+                    trend_mom = sarima_trends_mom.get(item, [0.0] * 12)[i - 1]
+                else:
+                    trend_mom = core_monthly_avg_growths[item].get(f_month, 0.0)
+                next_val = core_sim_indices_dict[item][-1] * (1 + trend_mom / 100)
+            core_sim_indices_dict[item].append(next_val)
+
+    core_total_weight = sum(core_component_weights.get(item, 0.0) for item in core_target_items)
+    core_hybrid_totals = []
+    for step in range(1, 13):
+        core_w_sum = sum(core_sim_indices_dict[item][step] * core_component_weights.get(item, 0.0) for item in core_target_items)
+        core_hybrid_totals.append(core_w_sum / core_total_weight if core_total_weight > 0 else last_row[total_col])
+
+    df_path_core_base = pd.DataFrame(index=future_dates, data={"Core_Total_Index": core_hybrid_totals})
+    core_hist_last_for_path = core_hist_series.dropna().iloc[-1] if core_hist_series.dropna().size > 0 else last_row[total_col]
+    core_base_indices_full = [core_hist_last_for_path] + list(df_path_core_base["Core_Total_Index"])
+    df_path_core_base["Core_MoM"] = np.diff(core_base_indices_full) / core_base_indices_full[:-1] * 100
+
+    core_base_yoy = []
+    for f_date in future_dates:
+        ly_date = f_date - pd.DateOffset(years=1)
+        if ly_date in core_hist_series.index:
+            ly_core_val = core_hist_series.loc[ly_date]
+        else:
+            closest_idx = core_hist_series.index[core_hist_series.index.get_indexer([ly_date], method='nearest')[0]]
+            ly_core_val = core_hist_series.loc[closest_idx]
+        core_base_yoy.append(((df_path_core_base.loc[f_date, "Core_Total_Index"] - ly_core_val) / ly_core_val) * 100 if ly_core_val != 0 else 0.0)
+    df_path_core_base["Core_YoY"] = core_base_yoy
 
     if "table_reset_counter" not in st.session_state:
         st.session_state["table_reset_counter"] = 0
         
     model_hint = "sarima" if "SARIMA" in current_model else "avg3y"
     session_df_key = f"df_sim_report_{model_hint}_v_{st.session_state['table_reset_counter']}"
+
+    current_tab2_signature = (
+        current_model,
+        float(st.session_state.get("agri_val", 0.0)),
+        float(st.session_state.get("petro_val", 0.0)),
+        float(st.session_state.get("fx_val", base_fx)),
+        float(st.session_state.get("core_oil_ex_val", rec_values['석유 외 공업제품'])),
+        float(st.session_state.get("utility_val", rec_values['전기수도가스'])),
+        float(st.session_state.get("housing_val", rec_values['집세'])),
+        float(st.session_state.get("public_val", rec_values['공공서비스'])),
+        float(st.session_state.get("personal_val", rec_values['개인서비스']))
+    )
+    prev_tab2_signature = st.session_state.get("tab2_signature")
+    if prev_tab2_signature != current_tab2_signature and session_df_key in st.session_state:
+        del st.session_state[session_df_key]
 
     col_sub_title, col_reset_btn = st.columns([4, 1])
     with col_sub_title:
@@ -506,7 +783,12 @@ with tab3:
         df_base_report["예상 MoM (%)"] = df_path_base["MoM"].values
         df_base_report["예상 원지수"] = df_path_base["Total_Index"].values
         df_base_report["예상 YoY (%)"] = df_path_base["YoY"].values
+        df_base_report["예상 core MoM (%)"] = df_path_core_base["Core_MoM"].values
+        df_base_report["예상 core 원지수"] = df_path_core_base["Core_Total_Index"].values
+        df_base_report["예상 core YoY (%)"] = df_path_core_base["Core_YoY"].values
         st.session_state[session_df_key] = df_base_report
+
+    st.session_state["tab2_signature"] = current_tab2_signature
 
     editor_key = f"editor_{model_hint}_v_{st.session_state['table_reset_counter']}"
     if editor_key in st.session_state and st.session_state[editor_key].get("edited_rows"):
@@ -516,7 +798,7 @@ with tab3:
             if "예상 MoM (%)" in updated_cols: 
                 df_working.iloc[row_idx, df_working.columns.get_loc("예상 MoM (%)")] = updated_cols["예상 MoM (%)"]
 
-        current_index_val = last_row['Total']
+        current_index_val = last_row[total_col]
         for idx in range(len(df_working)):
             mom_val = df_working.iloc[idx, df_working.columns.get_loc("예상 MoM (%)")]
             current_index_val = current_index_val * (1 + mom_val / 100)
@@ -524,10 +806,10 @@ with tab3:
             f_date_obj = future_dates[idx]
             ly_date = f_date_obj - pd.DateOffset(years=1)
             if ly_date in df_hist.index:
-                ly_total_val = df_hist.loc[ly_date, 'Total']
+                ly_total_val = df_hist.loc[ly_date, total_col]
             else:
                 closest_idx = df_hist.index[df_hist.index.get_indexer([ly_date], method='nearest')[0]]
-                ly_total_val = df_hist.loc[closest_idx, 'Total']
+                ly_total_val = df_hist.loc[closest_idx, total_col]
             df_working.iloc[idx, df_working.columns.get_loc("예상 YoY (%)")] = ((current_index_val - ly_total_val) / ly_total_val) * 100
 
         st.session_state[session_df_key] = df_working
@@ -540,11 +822,14 @@ with tab3:
 
     styled_df = st.session_state[session_df_key].style.apply(highlight_modifiable_col, axis=1)
     edited_df = st.data_editor(
-        styled_df, key=editor_key, disabled=["예상 원지수", "예상 YoY (%)"],
+        styled_df, key=editor_key, disabled=["예상 원지수", "예상 YoY (%)", "예상 core MoM (%)", "예상 core 원지수", "예상 core YoY (%)"],
         column_config={
             "예상 MoM (%)": st.column_config.NumberColumn("🎨 예상 MoM (%)", format="%.2f%%"),
             "예상 원지수": st.column_config.NumberColumn("예상 원지수", format="%.2f"),
             "예상 YoY (%)": st.column_config.NumberColumn("예상 YoY (%)", format="%.2f%%"),
+            "예상 core MoM (%)": st.column_config.NumberColumn("예상 core MoM (%)", format="%.2f%%"),
+            "예상 core 원지수": st.column_config.NumberColumn("예상 core 원지수", format="%.2f"),
+            "예상 core YoY (%)": st.column_config.NumberColumn("예상 core YoY (%)", format="%.2f%%"),
         }, use_container_width=True
     )
 
@@ -554,13 +839,13 @@ with tab3:
 
     current_sim_data = st.session_state[session_df_key]
     hist_short = df_hist[-24:] 
-    hist_mom_short = hist_mom_all['Total'].loc[hist_short.index]
-    hist_yoy_short = (df_hist['Total'].pct_change(12) * 100).loc[hist_short.index]
+    hist_mom_short = hist_mom_all[total_col].loc[hist_short.index]
+    hist_yoy_short = (df_hist[total_col].pct_change(12) * 100).loc[hist_short.index]
 
     fig_path = go.Figure()
     if "원지수" in path_view_mode:
-        fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short['Total'], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-        pred_y_arr = [hist_short['Total'].iloc[-1]] + list(current_sim_data["예상 원지수"])
+        fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short[total_col], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+        pred_y_arr = [hist_short[total_col].iloc[-1]] + list(current_sim_data["예상 원지수"])
         y_lbl = "CPI 원지수"
     elif "MoM" in path_view_mode:
         fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_mom_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
