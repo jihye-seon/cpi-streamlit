@@ -25,7 +25,7 @@ st.markdown("---")
 st.sidebar.header("📁 데이터 소스 정보")
 
 # 💡 내장할 엑셀 파일명 지정 (app.py와 같은 폴더에 위치해야 합니다)
-EXCEL_FILENAME = "CPI data_202605_1.xlsx"
+EXCEL_FILENAME = "CPI data_202605_v1.xlsx"
 
 @st.cache_data
 def process_embedded_excel(file_path):
