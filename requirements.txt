@@ -5,3 +5,4 @@ plotly
 statsmodels
 openpyxl
 sys
+pmdarima
