@@ -59,8 +59,9 @@ def process_embedded_excel(file_path):
         df_macro = df_macro.dropna(subset=['Date'])
         df_macro.set_index('Date', inplace=True)
         
-        macro_cols = ['WTI', 'Brent', 'USDKRW']
-        df_macro = df_macro[macro_cols]
+        macro_cols = ['WTI', 'Brent', 'USDKRW', 'PPI_Service']
+        available_macro_cols = [col for col in macro_cols if col in df_macro.columns]
+        df_macro = df_macro[available_macro_cols]
         
         df_merged = df_cpi.join(df_macro, how='inner')
         return df_merged.sort_index(), weights, df_macro, core_component_items
@@ -140,7 +141,7 @@ def _unique_preserve(seq):
             out.append(x)
     return out
 
-all_display_items = _unique_preserve(['총지수'] + volatile_items + ['가공식품', '이외공업제품'] + core_items)
+all_display_items = _unique_preserve(['총지수', 'Core'] + volatile_items + ['가공식품', '이외공업제품'] + core_items)
 
 BEST_ORDERS = {
     '이외공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)},
@@ -254,6 +255,12 @@ def prepare_sarima_exog(df, item):
         exog = df[['WTI']].copy()
         exog['WTI_lag1'] = exog['WTI'].shift(1)
         return exog[['WTI_lag1']]
+    if item == '개인서비스':
+        if 'PPI_Service' not in df.columns:
+            return None
+        exog = df[['PPI_Service']].copy()
+        exog['PPI_Service_lag1'] = exog['PPI_Service'].shift(1)
+        return exog[['PPI_Service_lag1']]
     return None
 
 
@@ -261,15 +268,34 @@ def prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=None):
     if forecast_macro_row is None:
         forecast_macro_row = df.iloc[-1]
 
+    if isinstance(forecast_macro_row, (list, tuple, np.ndarray, pd.Series)):
+        forecast_rows = list(forecast_macro_row)
+        if len(forecast_rows) < steps:
+            forecast_rows = forecast_rows + [forecast_rows[-1]] * (steps - len(forecast_rows))
+        forecast_rows = forecast_rows[:steps]
+    else:
+        forecast_rows = [forecast_macro_row] * steps
+
     if item == '이외공업제품':
-        forecast_vals = [
-            float(forecast_macro_row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0)),
-            float(forecast_macro_row.get('USDKRW', df['USDKRW'].iloc[-1] if 'USDKRW' in df.columns else 0.0))
-        ]
-        return np.tile(forecast_vals, (steps, 1))
+        forecast_vals = []
+        for row in forecast_rows:
+            forecast_vals.append([
+                float(row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0)),
+                float(row.get('USDKRW', df['USDKRW'].iloc[-1] if 'USDKRW' in df.columns else 0.0))
+            ])
+        return np.array(forecast_vals)
     if item == '전기수도가스':
-        forecast_wti = float(forecast_macro_row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0))
-        return np.full((steps, 1), forecast_wti)
+        forecast_wti_vals = []
+        for row in forecast_rows:
+            forecast_wti_vals.append(float(row.get('WTI', df['WTI'].iloc[-1] if 'WTI' in df.columns else 0.0)))
+        return np.array(forecast_wti_vals).reshape(-1, 1)
+    if item == '개인서비스':
+        if 'PPI_Service' in df.columns:
+            forecast_ppi_service_vals = []
+            for row in forecast_rows:
+                forecast_ppi_service_vals.append(float(row.get('PPI_Service', df['PPI_Service'].iloc[-1] if 'PPI_Service' in df.columns else 0.0)))
+            return np.array(forecast_ppi_service_vals).reshape(-1, 1)
+        return np.zeros((steps, 1))
     return None
 
 # ==========================================
@@ -567,6 +593,9 @@ with tab2:
     core_hist_last = core_hist_series.dropna().iloc[-1] if core_hist_series.dropna().size > 0 else last_row['총지수']
     core_mom_rate = ((core_pred_index - core_hist_last) / core_hist_last) * 100 if core_hist_last != 0 else 0.0
 
+    core_hist_mom = core_hist_series.pct_change() * 100
+    core_hist_yoy = core_hist_series.pct_change(12) * 100
+
     ly_date = pd.to_datetime(target_date) - pd.DateOffset(years=1)
     try:
         closest_ly_idx = df_hist.index[df_hist.index.get_indexer([ly_date], method='nearest')[0]]
@@ -593,25 +622,38 @@ with tab2:
     # ------------------------------------------
     # 📉 예측 스냅샷 시각화 시각화 레이어
     # ------------------------------------------
+    series_mode = st.radio("표시 시리즈 선택", ["총지수", "근원"], horizontal=True, key="snapshot_series_mode")
     chart_view_mode = st.radio("차트 표시 기준 선택", ["CPI 원지수", "MoM 상승률 (%)", "YoY 상승률 (%)"], horizontal=True, key="snapshot_view_mode")
     hist_subset = df_hist[-24:].copy()
     
-    df_hist_mom = df_hist['총지수'].pct_change() * 100
-    df_hist_yoy = df_hist['총지수'].pct_change(12) * 100
+    if series_mode == "근원":
+        hist_short_series = core_hist_series.loc[hist_subset.index]
+        df_hist_mom_series = core_hist_mom.loc[hist_subset.index]
+        df_hist_yoy_series = core_hist_yoy.loc[hist_subset.index]
+        pred_index_value = core_pred_index
+        pred_mom_value = core_mom_rate
+        pred_yoy_value = core_yoy_rate
+    else:
+        hist_short_series = hist_subset['총지수']
+        df_hist_mom_series = df_hist['총지수'].pct_change() * 100
+        df_hist_yoy_series = df_hist['총지수'].pct_change(12) * 100
+        pred_index_value = total_pred_index
+        pred_mom_value = total_mom_rate
+        pred_yoy_value = total_yoy_rate
 
     fig_dashboard = go.Figure()
     if "원지수" in chart_view_mode:
-        y_hist = hist_subset['총지수'].values
-        y_pred_line = [hist_subset['총지수'].iloc[-1], total_pred_index]
-        y_title = "CPI 총지수"
+        y_hist = hist_short_series.values
+        y_pred_line = [hist_short_series.iloc[-1], pred_index_value]
+        y_title = f"{series_mode} 원지수"
     elif "MoM" in chart_view_mode:
-        y_hist = df_hist_mom.loc[hist_subset.index].values
-        y_pred_line = [df_hist_mom.iloc[-1], total_mom_rate]
-        y_title = "전월비 상승률 (MoM %)"
+        y_hist = df_hist_mom_series.loc[hist_subset.index].values
+        y_pred_line = [df_hist_mom_series.iloc[-1], pred_mom_value]
+        y_title = f"{series_mode} 전월비 상승률 (MoM %)"
     else:
-        y_hist = df_hist_yoy.loc[hist_subset.index].values
-        y_pred_line = [df_hist_yoy.iloc[-1], total_yoy_rate]
-        y_title = "전년동월비 상승률 (YoY %)"
+        y_hist = df_hist_yoy_series.loc[hist_subset.index].values
+        y_pred_line = [df_hist_yoy_series.iloc[-1], pred_yoy_value]
+        y_title = f"{series_mode} 전년동월비 상승률 (YoY %)"
 
     fig_dashboard.add_trace(go.Scatter(x=hist_subset.index, y=y_hist, name='과거 확정치', mode='lines+markers', line=dict(color='#1f77b4', width=3)))
     fig_dashboard.add_trace(go.Scatter(x=[hist_subset.index[-1], pd.to_datetime(target_date)], y=y_pred_line, name='근월 추정치', mode='lines+markers', line=dict(color='#e377c2', width=3, dash='dash')))
@@ -620,6 +662,60 @@ with tab2:
     
     # Tab3에서 사용할 pred_indices를 session_state에 저장
     st.session_state['pred_indices'] = pred_indices
+
+def build_future_macro_rows(latest_macro_row=None):
+    latest_macro_row = latest_macro_row if latest_macro_row is not None else {}
+
+    def _get_value(col, default=0.0):
+        try:
+            return float(latest_macro_row.get(col, default))
+        except Exception:
+            return float(default)
+
+    default_wti = _get_value('WTI', 0.0)
+    default_krwusd = _get_value('USDKRW', 0.0)
+    default_ppi_service = _get_value('PPI_Service', 0.0)
+
+    horizon_values = {
+        '3m': {
+            'WTI': float(st.session_state.get('forecast_wti_3m', default_wti)),
+            'USDKRW': float(st.session_state.get('forecast_krwusd_3m', default_krwusd)),
+            'PPI_Service': float(st.session_state.get('forecast_ppi_service_3m', default_ppi_service))
+        },
+        '6m': {
+            'WTI': float(st.session_state.get('forecast_wti_6m', default_wti)),
+            'USDKRW': float(st.session_state.get('forecast_krwusd_6m', default_krwusd)),
+            'PPI_Service': float(st.session_state.get('forecast_ppi_service_6m', default_ppi_service))
+        },
+        '9m': {
+            'WTI': float(st.session_state.get('forecast_wti_9m', default_wti)),
+            'USDKRW': float(st.session_state.get('forecast_krwusd_9m', default_krwusd)),
+            'PPI_Service': float(st.session_state.get('forecast_ppi_service_9m', default_ppi_service))
+        },
+        '12m': {
+            'WTI': float(st.session_state.get('forecast_wti_12m', default_wti)),
+            'USDKRW': float(st.session_state.get('forecast_krwusd_12m', default_krwusd)),
+            'PPI_Service': float(st.session_state.get('forecast_ppi_service_12m', default_ppi_service))
+        }
+    }
+
+    rows = []
+    for step in range(1, 13):
+        if step <= 3:
+            horizon_key = '3m'
+        elif step <= 6:
+            horizon_key = '6m'
+        elif step <= 9:
+            horizon_key = '9m'
+        else:
+            horizon_key = '12m'
+        rows.append({
+            'WTI': horizon_values[horizon_key]['WTI'],
+            'USDKRW': horizon_values[horizon_key]['USDKRW'],
+            'PPI_Service': horizon_values[horizon_key]['PPI_Service']
+        })
+    return rows
+
 
 @st.cache_data
 def predict_all_items_sarima_mom_track(df, w_dict, forecast_macro_row=None):
@@ -673,8 +769,34 @@ with tab3:
     # 탭2의 현재 사용자 조정값을 기준으로 최신 예측값 재계산
     pred_indices, _ = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
 
+    st.subheader("📉 향후 외생변수 가정(SARIMA)")
+    st.caption("SARIMA 모형을 선택한 경우, 2개월차 이후 경로는 아래 입력값을 반영한 외생변수로 계산됩니다.")
+    latest_macro_row = df_macro_raw.iloc[-1] if df_macro_raw is not None and not df_macro_raw.empty else None
+    latest_wti = float(latest_macro_row.get('WTI', 0.0)) if latest_macro_row is not None and hasattr(latest_macro_row, 'get') else 0.0
+    latest_krwusd = float(latest_macro_row.get('USDKRW', 0.0)) if latest_macro_row is not None and hasattr(latest_macro_row, 'get') else 0.0
+
+    col3m, col6m, col9m, col12m = st.columns(4)
+    with col3m:
+        st.markdown("**~3개월**")
+        st.number_input("WTI", key="forecast_wti_3m", value=latest_wti, step=0.01, format="%.2f")
+        st.number_input("KRW/USD", key="forecast_krwusd_3m", value=latest_krwusd, step=0.01, format="%.2f")
+    with col6m:
+        st.markdown("**~6개월**")
+        st.number_input("WTI", key="forecast_wti_6m", value=latest_wti, step=0.01, format="%.2f")
+        st.number_input("KRW/USD", key="forecast_krwusd_6m", value=latest_krwusd, step=0.01, format="%.2f")
+    with col9m:
+        st.markdown("**~9개월**")
+        st.number_input("WTI", key="forecast_wti_9m", value=latest_wti, step=0.01, format="%.2f")
+        st.number_input("KRW/USD", key="forecast_krwusd_9m", value=latest_krwusd, step=0.01, format="%.2f")
+    with col12m:
+        st.markdown("**~12개월**")
+        st.number_input("WTI", key="forecast_wti_12m", value=latest_wti, step=0.01, format="%.2f")
+        st.number_input("KRW/USD", key="forecast_krwusd_12m", value=latest_krwusd, step=0.01, format="%.2f")
+
+    future_macro_rows = build_future_macro_rows(latest_macro_row)
+
     # SARIMA 모델 실행
-    sarima_trends_mom = predict_all_items_sarima_mom_track(df_hist, weights, forecast_macro_row=macro_target_row)
+    sarima_trends_mom = predict_all_items_sarima_mom_track(df_hist, weights, forecast_macro_row=future_macro_rows)
 
     # 시뮬레이션 대상 항목 필터링 (weights의 키 중 실제 df_hist에 존재하는 항목만)
     target_items = [item for item in total_index_items if item in df_hist.columns]
@@ -854,26 +976,45 @@ with tab3:
 
     st.markdown("---")
     st.subheader(f"📉 {current_model} 기반 물가 경로")
+    path_series_mode = st.radio("표시 시리즈 선택", ["총지수", "근원"], horizontal=True, key="path_series_mode")
     path_view_mode = st.radio("분석할 물가 지표 선택", ["CPI 원지수", "MoM 상승률 (%)", "YoY 상승률 (%)"], horizontal=True, key="path_view_mode")
 
     current_sim_data = st.session_state[session_df_key]
-    hist_short = df_hist[-24:] 
+    hist_short = df_hist[-24:]
+    core_hist_series = get_core_history_series(df_hist)
+    core_hist_short = core_hist_series.loc[hist_short.index]
     hist_mom_short = hist_mom_all[total_col].loc[hist_short.index]
     hist_yoy_short = (df_hist[total_col].pct_change(12) * 100).loc[hist_short.index]
+    core_mom_short = core_hist_series.pct_change() * 100
+    core_yoy_short = core_hist_series.pct_change(12) * 100
 
     fig_path = go.Figure()
-    if "원지수" in path_view_mode:
-        fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short[total_col], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-        pred_y_arr = [hist_short[total_col].iloc[-1]] + list(current_sim_data["예상 원지수"])
-        y_lbl = "CPI 원지수"
-    elif "MoM" in path_view_mode:
-        fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_mom_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-        pred_y_arr = [hist_mom_short.iloc[-1]] + list(current_sim_data["예상 MoM (%)"])
-        y_lbl = "MoM 상승률 (%)"
+    if path_series_mode == "근원":
+        if "원지수" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_hist_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_hist_short.iloc[-1]] + list(current_sim_data["예상 core 원지수"])
+            y_lbl = "근원 원지수"
+        elif "MoM" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_mom_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_mom_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core MoM (%)"])
+            y_lbl = "근원 MoM 상승률 (%)"
+        else:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_yoy_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_yoy_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core YoY (%)"])
+            y_lbl = "근원 YoY 상승률 (%)"
     else:
-        fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_yoy_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-        pred_y_arr = [hist_yoy_short.iloc[-1]] + list(current_sim_data["예상 YoY (%)"])
-        y_lbl = "YoY 상승률 (%)"
+        if "원지수" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short[total_col], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_short[total_col].iloc[-1]] + list(current_sim_data["예상 원지수"])
+            y_lbl = "CPI 원지수"
+        elif "MoM" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_mom_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_mom_short.iloc[-1]] + list(current_sim_data["예상 MoM (%)"])
+            y_lbl = "MoM 상승률 (%)"
+        else:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_yoy_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_yoy_short.iloc[-1]] + list(current_sim_data["예상 YoY (%)"])
+            y_lbl = "YoY 상승률 (%)"
 
     fig_path.add_trace(go.Scatter(
         x=extended_dates, y=pred_y_arr, name=f'추정 경로 ({current_model})', mode='lines+markers',
