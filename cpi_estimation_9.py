@@ -185,6 +185,97 @@ def get_sarima_order(item):
     return (1, 1, 1), (1, 1, 0, 12)
 
 
+OTHER_MANUFACTURED_EXOG_CANDIDATES = [
+    {
+        'name': 'oil_only_lagged',
+        'columns': ['WTI_diff_lag1', 'WTI_diff_lag2'],
+        'lag_spec': {'WTI': [1, 2]},
+    },
+    {
+        'name': 'fx_only_lagged',
+        'columns': ['USDKRW_diff_lag1'],
+        'lag_spec': {'USDKRW': [1]},
+    },
+]
+
+
+@st.cache_data
+def select_other_manufactured_exog_spec(df):
+    item = '이외공업제품'
+    if item not in df.columns:
+        return {'name': 'none', 'columns': [], 'lag_spec': {}, 'reason': 'item_missing'}
+
+    order, seasonal_order = get_sarima_order(item)
+    valid_candidates = []
+    fitted_candidates = []
+
+    for candidate in OTHER_MANUFACTURED_EXOG_CANDIDATES:
+        cols = candidate['columns']
+        if not all(col in df.columns for col in cols):
+            continue
+        combined = df[[item]].join(df[cols], how='inner').dropna()
+        if combined.empty:
+            continue
+
+        try:
+            fit = SARIMAX(
+                combined[item],
+                exog=combined[cols],
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+        except Exception:
+            continue
+
+        params = fit.params.reindex(cols)
+        pvalues = fit.pvalues.reindex(cols)
+        sign_ok = bool((params > 0).all())
+        significant = bool((pvalues < 0.1).any())
+        fitted = {
+            **candidate,
+            'aic': float(fit.aic),
+            'sign_ok': sign_ok,
+            'significant': significant,
+            'params': {col: float(params[col]) for col in cols},
+            'pvalues': {col: float(pvalues[col]) for col in cols},
+        }
+        fitted_candidates.append(fitted)
+        if sign_ok and significant:
+            valid_candidates.append(fitted)
+
+    if valid_candidates:
+        selected = min(valid_candidates, key=lambda x: x['aic'])
+        return {**selected, 'reason': 'sign_ok_lowest_aic'}
+
+    if fitted_candidates:
+        best_aic = min(fitted_candidates, key=lambda x: x['aic'])
+        return {
+            'name': 'none',
+            'columns': [],
+            'lag_spec': {},
+            'reason': 'no_sign_consistent_candidate',
+            'best_aic_candidate': best_aic,
+        }
+
+    return {'name': 'none', 'columns': [], 'lag_spec': {}, 'reason': 'no_fitted_candidate'}
+
+
+def get_other_manufactured_exog_selection_note(df):
+    spec = select_other_manufactured_exog_spec(df)
+    if spec.get('name') != 'none':
+        return f"이외공업제품 외생변수 선택: {spec['name']} / columns={spec['columns']} / AIC={spec.get('aic', 0):.2f}"
+    best = spec.get('best_aic_candidate')
+    if best:
+        return (
+            "이외공업제품 외생변수 선택: 없음 "
+            f"(환율-only/유가-only 모두 기대 부호를 만족하지 않음; "
+            f"AIC 최저 후보={best['name']}, AIC={best['aic']:.2f})"
+        )
+    return "이외공업제품 외생변수 선택: 없음"
+
+
 def format_sarima_order(item):
     order, seasonal_order = get_sarima_order(item)
     return f"적용 차수: order={order}, seasonal_order={seasonal_order}"
@@ -272,12 +363,19 @@ def compute_tab2_pred_indices(last_row, rec_values, session_state, base_fx_value
 
 
 def prepare_sarima_exog(df, item):
+    petroleum_cols = ['WTI', 'WTI_diff_lag0', 'WTI_diff_lag1', 'WTI_diff_lag2']
     other_manufactured_cols = ['WTI_diff_lag1', 'WTI_diff_lag2', 'USDKRW_diff_lag1']
     processed_cols = ['USDKRW_diff_lag2']
 
+    if item == '석유제품':
+        if all(col in df.columns for col in petroleum_cols):
+            return df[petroleum_cols].copy()
+        return None
     if item == '이외공업제품':
-        if all(col in df.columns for col in other_manufactured_cols):
-            return df[other_manufactured_cols].copy()
+        selected_spec = select_other_manufactured_exog_spec(df)
+        selected_cols = selected_spec.get('columns', [])
+        if selected_cols and all(col in df.columns for col in selected_cols):
+            return df[selected_cols].copy()
         return None
     if item == '가공식품':
         if all(col in df.columns for col in processed_cols):
@@ -328,6 +426,26 @@ def _build_diff_forecast_exog(df, forecast_rows, lag_spec):
     return np.array(forecast_vals)
 
 
+def _build_level_diff_forecast_exog(df, forecast_rows, value_col, diff_lags=(0, 1, 2)):
+    history = {
+        'level': _get_latest_float(df, value_col, 0.0),
+        'diffs': [
+            _get_latest_float(df, f'{value_col}_diff_lag0', 0.0),
+            _get_latest_float(df, f'{value_col}_diff_lag1', 0.0),
+            _get_latest_float(df, f'{value_col}_diff_lag2', 0.0),
+        ]
+    }
+    forecast_vals = []
+    for row in forecast_rows:
+        current_level = float(row.get(value_col, history['level']))
+        current_diff = current_level - history['level']
+        available_diffs = [current_diff] + history['diffs']
+        forecast_vals.append([current_level] + [available_diffs[lag] for lag in diff_lags])
+        history['level'] = current_level
+        history['diffs'] = [current_diff] + history['diffs'][:2]
+    return np.array(forecast_vals)
+
+
 def prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=None):
     if forecast_macro_row is None:
         forecast_macro_row = df.iloc[-1]
@@ -342,8 +460,14 @@ def prepare_sarima_forecast_exog(df, item, steps=1, forecast_macro_row=None):
     else:
         forecast_rows = [forecast_macro_row] * steps
 
+    if item == '석유제품':
+        return _build_level_diff_forecast_exog(df, forecast_rows, 'WTI', diff_lags=(0, 1, 2))
     if item == '이외공업제품':
-        return _build_diff_forecast_exog(df, forecast_rows, {'WTI': [1, 2], 'USDKRW': [1]})
+        selected_spec = select_other_manufactured_exog_spec(df)
+        lag_spec = selected_spec.get('lag_spec', {})
+        if lag_spec:
+            return _build_diff_forecast_exog(df, forecast_rows, lag_spec)
+        return None
     if item == '가공식품':
         return _build_diff_forecast_exog(df, forecast_rows, {'USDKRW': [2]})
     if item == '개인서비스':
@@ -894,16 +1018,18 @@ with tab2:
     st.plotly_chart(fig_dashboard, use_container_width=True)
     
 
-    with st.expander("📌 SARIMA 계수 결과 확인", expanded=False):
-     if sarima_coeff_results:
-        for item in sarima_target_items:
-            if item not in sarima_coeff_results:
-                continue
-            st.markdown(f"### {item}")
-            display_coeff_df = sarima_coeff_results[item][['variable', 'coef', 'stderr', 't', 'pvalue', 'ci_lower', 'ci_upper', 'significant']].copy()
-            st.dataframe(display_coeff_df, use_container_width=True)
-     else:
-        st.info("계수 결과를 불러오지 못했습니다.")
+    #with st.expander("📌 SARIMA 계수 결과 확인", expanded=False):
+    # if sarima_coeff_results:
+    #    for item in sarima_target_items:
+    #        if item not in sarima_coeff_results:
+    #            continue
+    #        st.markdown(f"### {item}")
+    #        if item == '이외공업제품':
+    #            st.caption(get_other_manufactured_exog_selection_note(df_hist))
+    #        display_coeff_df = sarima_coeff_results[item][['variable', 'coef', 'stderr', 't', 'pvalue', 'ci_lower', 'ci_upper', 'significant']].copy()
+    #        st.dataframe(display_coeff_df, use_container_width=True)
+    # else:
+    #    st.info("계수 결과를 불러오지 못했습니다.")
 
 
 
