@@ -28,11 +28,11 @@ st.sidebar.header("📁 데이터 소스 정보")
 EXCEL_FILENAME = "CPI data_202605_v1.xlsx"
 
 @st.cache_data
-def process_embedded_excel(file_path):
+def process_embedded_excel(file_path, file_mtime_ns=None, file_size=None):
     try:
         # 파일이 실제로 디렉토리에 존재하는지 검증
         if not os.path.exists(file_path):
-            return None, None, None
+            return None, None, None, []
             
         # cpi_data 로드 (날짜 가공 및 인덱스 설정)
         df_cpi = pd.read_excel(file_path, sheet_name="CPI_Data", header=0)
@@ -91,7 +91,19 @@ def process_embedded_excel(file_path):
         return None, None, None, []
 
 # 유저 업로드 인터페이스 없이, 서버 내부의 엑셀 파일을 자동 호출
-df_hist, cpi_weights, df_macro_raw, core_component_items = process_embedded_excel(EXCEL_FILENAME)
+if os.path.exists(EXCEL_FILENAME):
+    excel_stat = os.stat(EXCEL_FILENAME)
+    excel_mtime_ns = excel_stat.st_mtime_ns
+    excel_size = excel_stat.st_size
+else:
+    excel_mtime_ns = None
+    excel_size = None
+
+df_hist, cpi_weights, df_macro_raw, core_component_items = process_embedded_excel(
+    EXCEL_FILENAME,
+    excel_mtime_ns,
+    excel_size,
+)
 
 # 깃허브에 파일이 누락되었거나 로드에 실패했을 때의 안내 가드레일
 if df_hist is None:
