@@ -593,20 +593,64 @@ def fetch_live_agri_mom():
     }
 
 
-def load_live_defaults():
-    """두 소스를 각각 독립적으로 수집한다. 한쪽이 실패해도 다른 쪽은 살린다."""
-    out = {"petro": None, "agri": None, "errors": [], "fetched": True}
+SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "live_snapshot.json")
 
-    if not LIVE_MODULES_OK:
-        out["errors"].append(f"수집 모듈 로드 실패: {LIVE_IMPORT_ERR}")
-        return out
+
+@st.cache_data
+def load_snapshot(file_mtime=None):
+    """
+    make_snapshot.py 가 만들어 둔 스냅샷을 읽는다.
+    일부 국내 사이트는 해외 클라우드 IP를 차단하므로, 실시간 수집이 막힌
+    환경에서는 이 값으로 대체한다.
+    """
+    if not os.path.exists(SNAPSHOT_FILE):
+        return None
+
+    import json
+    with open(SNAPSHOT_FILE, encoding="utf-8") as f:
+        snap = json.load(f)
+
+    for key in ("petro", "agri"):
+        if snap.get(key) and isinstance(snap[key].get("detail"), list):
+            snap[key]["detail"] = pd.DataFrame(snap[key]["detail"])
+
+    return snap
+
+
+def load_live_defaults():
+    """
+    두 소스를 각각 독립적으로 수집한다. 한쪽이 실패해도 다른 쪽은 살린다.
+    실시간 수집이 실패한 소스는 스냅샷 파일 값으로 대체한다.
+    """
+    out = {"petro": None, "agri": None, "errors": [],
+           "sources": {}, "fetched": True}
+
+    try:
+        snap = load_snapshot(os.path.getmtime(SNAPSHOT_FILE)
+                             if os.path.exists(SNAPSHOT_FILE) else None)
+    except Exception:
+        snap = None
 
     for key, fn, label in (("petro", fetch_live_petro_mom, "석유제품"),
                            ("agri", fetch_live_agri_mom, "농축수산물")):
-        try:
-            out[key] = fn()
-        except Exception as e:
-            out["errors"].append(f"{label}: {e}")
+        if not LIVE_MODULES_OK:
+            err = f"수집 모듈 로드 실패: {LIVE_IMPORT_ERR}"
+        else:
+            try:
+                out[key] = fn()
+                out["sources"][key] = "실시간"
+                continue
+            except Exception as e:
+                err = str(e)
+
+        # 실시간 실패 -> 스냅샷 폴백
+        if snap and snap.get(key):
+            out[key] = snap[key]
+            out["sources"][key] = f"스냅샷 ({snap.get('generated_at', '시점 미상')})"
+            out["errors"].append(f"{label} 실시간 수집 실패 → 스냅샷 사용 : {err}")
+        else:
+            out["errors"].append(f"{label}: {err}")
 
     return out
 
@@ -849,26 +893,29 @@ with tab2:
 
         if live.get("agri") or live.get("petro"):
             info_cols = st.columns(2)
+            srcs = live.get("sources", {})
             if live["agri"]:
                 a = live["agri"]
                 cov = a["coverage"].get("가중치 커버리지(%)", float('nan'))
                 info_cols[0].metric(
-                    f"🌾 농축수산물 실시간 ({a['curr']})",
+                    f"🌾 농축수산물 ({a['curr']})",
                     f"{a['mom']:+.3f}%",
                     delta=f"실측만 {a['mom_actual']:+.2f}%",
                     delta_color="off",
                     help=f"KAMIS 농·수산물 + EKAPE 축산물 가중합산 "
                          f"(가중치 커버리지 {cov:.1f}%, 조사일 {a.get('survey_date') or '-'})",
                 )
+                info_cols[0].caption(f"출처: {srcs.get('agri', '-')}")
             if live["petro"]:
                 p = live["petro"]
                 info_cols[1].metric(
-                    f"⛽ 석유제품 실시간 ({p['curr']})",
+                    f"⛽ 석유제품 ({p['curr']})",
                     f"{p['mom']:+.3f}%",
                     delta=f"vs {p['prev']}",
                     delta_color="off",
                     help="오피넷 일별 가격의 월평균 기준 가중합산 MoM",
                 )
+                info_cols[1].caption(f"출처: {srcs.get('petro', '-')}")
 
             stale = [lbl for lbl, d in (("농축수산물", live["agri"]), ("석유제품", live["petro"]))
                      if d and d["curr"] != target_lbl]
