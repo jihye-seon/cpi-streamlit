@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime
 #import sys
 import plotly.graph_objects as go
 import warnings
@@ -46,7 +45,6 @@ def process_embedded_excel(file_path, file_mtime_ns=None, file_size=None):
         
         core_component_items = []
         if len(df_weights.columns) > 2:
-            core_flag_col = df_weights.columns[2]
             for _, row in df_weights.iterrows():
                 item_name = row.iloc[0]
                 flag_value = row.iloc[2]
@@ -91,19 +89,7 @@ def process_embedded_excel(file_path, file_mtime_ns=None, file_size=None):
         return None, None, None, []
 
 # 유저 업로드 인터페이스 없이, 서버 내부의 엑셀 파일을 자동 호출
-if os.path.exists(EXCEL_FILENAME):
-    excel_stat = os.stat(EXCEL_FILENAME)
-    excel_mtime_ns = excel_stat.st_mtime_ns
-    excel_size = excel_stat.st_size
-else:
-    excel_mtime_ns = None
-    excel_size = None
-
-df_hist, cpi_weights, df_macro_raw, core_component_items = process_embedded_excel(
-    EXCEL_FILENAME,
-    excel_mtime_ns,
-    excel_size,
-)
+df_hist, cpi_weights, df_macro_raw, core_component_items = process_embedded_excel(EXCEL_FILENAME)
 
 # 깃허브에 파일이 누락되었거나 로드에 실패했을 때의 안내 가드레일
 if df_hist is None:
@@ -155,6 +141,9 @@ if "weights" not in st.session_state:
     except Exception:
         st.session_state["weights"] = {}
         
+# 단일 워킹 소스: cpi_weights(원본 로드)는 세션 초기화에만 쓰고,
+# 이후 모든 가중치 집계는 세션 복사본인 weights 를 사용한다.
+# (향후 가중치 수기조정 UI는 st.session_state["weights"] 에 기록 → 자동 반영)
 weights = st.session_state["weights"]
 
 # 과거 등락률 매트릭스 계산
@@ -254,8 +243,7 @@ def build_monthly_avg_growths(df_mom, target_items):
     return monthly_avg_growths
 
 
-def compute_tab2_pred_indices(last_row, rec_values, session_state, base_fx_value):
-   
+def compute_tab2_pred_indices(last_row, rec_values, session_state):
     mom_agri = float(session_state.get('agri_val', 0.0))
     mom_petro = float(session_state.get('petro_val', 0.0))
     mom_processed = float(session_state.get('processed_val', rec_values.get('가공식품', 0.0)))
@@ -556,13 +544,111 @@ with st.sidebar:
 
 
 # ==========================================
+# 🌐 [LIVE] 외부 사이트 실시간 MoM 수집
+#    · 석유제품   : 오피넷 (opinet_daily_price)
+#    · 농축수산물 : KAMIS + 축평원 EKAPE (kamis_retail_price)
+# ==========================================
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import opinet_daily_price as opinet_src
+    import kamis_retail_price as kamis_src
+    LIVE_MODULES_OK, LIVE_IMPORT_ERR = True, None
+except Exception as _e:               # 모듈이 없어도 앱은 정상 동작해야 한다
+    opinet_src = kamis_src = None
+    LIVE_MODULES_OK, LIVE_IMPORT_ERR = False, str(_e)
+
+
+def _clamp(x, lo, hi):
+    return float(min(max(x, lo), hi))
+
+
+@st.cache_data(ttl=3600, show_spinner="🌐 오피넷에서 석유제품 가격을 가져오는 중...")
+def fetch_live_petro_mom():
+    """오피넷 일별 가격 -> 석유류 가중합산 MoM(%)"""
+    r = opinet_src.get_price_mom(verbose=False)
+    months = [str(i) for i in r["monthly"].index]
+    return {
+        "mom": float(r["group_mom"]),
+        "curr": months[-1],
+        "prev": months[-2],
+        "detail": r["weighted"].reset_index(),
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner="🌐 KAMIS·EKAPE에서 농축수산물 가격을 가져오는 중...")
+def fetch_live_agri_mom():
+    """KAMIS 농·수산물 + EKAPE 축산물 -> 농축수산물 가중합산 MoM(%)"""
+    r = kamis_src.get_price_mom(verbose=False)
+    y, m = r["year"], r["month"]
+    py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+    return {
+        "mom": float(r["group_mom"]),
+        "mom_actual": float(r["group_mom_actual"]),
+        "curr": f"{y}-{m:02d}",
+        "prev": f"{py}-{pm:02d}",
+        "coverage": r["coverage"],
+        "survey_date": r.get("survey_date"),
+        "detail": r["weighted"],
+    }
+
+
+def load_live_defaults():
+    """두 소스를 각각 독립적으로 수집한다. 한쪽이 실패해도 다른 쪽은 살린다."""
+    out = {"petro": None, "agri": None, "errors": [], "fetched": True}
+
+    if not LIVE_MODULES_OK:
+        out["errors"].append(f"수집 모듈 로드 실패: {LIVE_IMPORT_ERR}")
+        return out
+
+    for key, fn, label in (("petro", fetch_live_petro_mom, "석유제품"),
+                           ("agri", fetch_live_agri_mom, "농축수산물")):
+        try:
+            out[key] = fn()
+        except Exception as e:
+            out["errors"].append(f"{label}: {e}")
+
+    return out
+
+
+def apply_live_to_inputs(data):
+    """수집값을 변동성 품목 입력값(슬라이더·직접입력)에 반영한다."""
+    if data.get("agri"):
+        v = _clamp(data["agri"]["mom"], -5.0, 5.0)
+        st.session_state.agri_val = v
+        st.session_state.agri_val_slider = v
+        st.session_state.agri_val_exact = v
+    if data.get("petro"):
+        v = _clamp(data["petro"]["mom"], -10.0, 10.0)
+        st.session_state.petro_val = v
+        st.session_state.petro_val_slider = v
+        st.session_state.petro_val_exact = v
+
+
+def refresh_live_prices():
+    """캐시를 비우고 다시 수집한 뒤 입력값에 반영한다."""
+    fetch_live_petro_mom.clear()
+    fetch_live_agri_mom.clear()
+    data = load_live_defaults()
+    st.session_state["live"] = data
+    apply_live_to_inputs(data)
+
+
+# 자동 수집하지 않는다. TAB 2의 버튼을 누를 때만 네트워크 호출이 일어난다.
+if "live" not in st.session_state:
+    st.session_state["live"] = {"petro": None, "agri": None,
+                                "errors": [], "fetched": False}
+
+live = st.session_state["live"]
+
+# 슬라이더 허용 범위에 맞춰 클리핑한 기본값 (미수집 시 0.0)
+DEFAULT_AGRI = _clamp(live["agri"]["mom"], -5.0, 5.0) if live.get("agri") else 0.0
+DEFAULT_PETRO = _clamp(live["petro"]["mom"], -10.0, 10.0) if live.get("petro") else 0.0
+
+
+# ==========================================
 # 🔄 세션 상태(Session State) 초기화 및 매핑
 # ==========================================
-base_fx = float(round(
-    macro_target_row.get('USDKRW', last_row.get('USDKRW', 0.0)) if macro_target_row is not None else last_row.get('USDKRW', 0.0),
-    1
-))
-
 if "model_choice" not in st.session_state:
     st.session_state.model_choice = "🤖 SARIMA 모델"
 
@@ -580,8 +666,9 @@ else:
     rec_values = seasonal_preds
 
 # 최초 세션 세팅 (새로운 한글 대분류 반영)
-if "agri_val" not in st.session_state: st.session_state.agri_val = 0.0
-if "petro_val" not in st.session_state: st.session_state.petro_val = 0.0
+# 변동성 품목 기본값 = 실시간 시세에서 산출한 MoM (수집 실패 시 0.0)
+if "agri_val" not in st.session_state: st.session_state.agri_val = DEFAULT_AGRI
+if "petro_val" not in st.session_state: st.session_state.petro_val = DEFAULT_PETRO
 
 
 if "processed_val" not in st.session_state: st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
@@ -596,8 +683,12 @@ if "prev_model" not in st.session_state:
     st.session_state.prev_model = current_model
 
 if st.session_state.prev_model != current_model:
-    st.session_state.agri_val = 0.0
-    st.session_state.petro_val = 0.0
+    st.session_state.agri_val = DEFAULT_AGRI
+    st.session_state.petro_val = DEFAULT_PETRO
+    st.session_state.agri_val_slider = DEFAULT_AGRI
+    st.session_state.agri_val_exact = DEFAULT_AGRI
+    st.session_state.petro_val_slider = DEFAULT_PETRO
+    st.session_state.petro_val_exact = DEFAULT_PETRO
     st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
     st.session_state.other_manuf_val = float(rec_values.get('이외공업제품', 0.0))
     st.session_state.utility_val = float(rec_values['전기수도가스'])
@@ -719,12 +810,12 @@ with tab2:
         st.write("") 
         st.write("")
         if st.button("🔄 품목별 예상치 초기화 (추천값 복원)", use_container_width=True, type="secondary"):
-            st.session_state.agri_val = 0.0
-            st.session_state.agri_val_slider = 0.0
-            st.session_state.agri_val_exact = 0.0
-            st.session_state.petro_val = 0.0
-            st.session_state.petro_val_slider = 0.0
-            st.session_state.petro_val_exact = 0.0
+            st.session_state.agri_val = DEFAULT_AGRI
+            st.session_state.agri_val_slider = DEFAULT_AGRI
+            st.session_state.agri_val_exact = DEFAULT_AGRI
+            st.session_state.petro_val = DEFAULT_PETRO
+            st.session_state.petro_val_slider = DEFAULT_PETRO
+            st.session_state.petro_val_exact = DEFAULT_PETRO
             st.session_state.processed_val = float(rec_values.get('가공식품', 0.0))
             st.session_state.other_manuf_val = float(rec_values.get('이외공업제품', 0.0))
             st.session_state.utility_val = float(rec_values['전기수도가스'])
@@ -739,21 +830,85 @@ with tab2:
     with col_left:
         st.subheader("⛽ 1. 변동성 품목 수기조정")
         
+        target_lbl = target_date.strftime('%Y-%m')
+
+        # ---- 실시간 시세 (버튼 클릭 시에만 수집) ----
+        fetch_col, note_col = st.columns([1, 2])
+        with fetch_col:
+            if st.button("🌐 실시간 시세 가져오기", use_container_width=True,
+                         type="primary" if not live.get("fetched") else "secondary",
+                         key="fetch_live_tab2"):
+                refresh_live_prices()
+                st.rerun()
+        with note_col:
+            if live.get("fetched"):
+                st.caption("오피넷 · KAMIS · EKAPE에서 수집한 값이 아래 입력값에 반영되었습니다.")
+            else:
+                st.caption("버튼을 누르면 각 사이트에서 당월 MoM을 수집해 "
+                           "아래 입력값에 자동 반영합니다 (30~40초).")
+
+        if live.get("agri") or live.get("petro"):
+            info_cols = st.columns(2)
+            if live["agri"]:
+                a = live["agri"]
+                cov = a["coverage"].get("가중치 커버리지(%)", float('nan'))
+                info_cols[0].metric(
+                    f"🌾 농축수산물 실시간 ({a['curr']})",
+                    f"{a['mom']:+.3f}%",
+                    delta=f"실측만 {a['mom_actual']:+.2f}%",
+                    delta_color="off",
+                    help=f"KAMIS 농·수산물 + EKAPE 축산물 가중합산 "
+                         f"(가중치 커버리지 {cov:.1f}%, 조사일 {a.get('survey_date') or '-'})",
+                )
+            if live["petro"]:
+                p = live["petro"]
+                info_cols[1].metric(
+                    f"⛽ 석유제품 실시간 ({p['curr']})",
+                    f"{p['mom']:+.3f}%",
+                    delta=f"vs {p['prev']}",
+                    delta_color="off",
+                    help="오피넷 일별 가격의 월평균 기준 가중합산 MoM",
+                )
+
+            stale = [lbl for lbl, d in (("농축수산물", live["agri"]), ("석유제품", live["petro"]))
+                     if d and d["curr"] != target_lbl]
+            if stale:
+                st.warning(
+                    f"⚠️ {', '.join(stale)} 실시간 데이터의 기준월이 추정 대상월({target_lbl})과 "
+                    f"다릅니다. 값을 그대로 쓰기 전에 확인하세요."
+                )
+
+            with st.expander("📄 실시간 시세 산출 내역 보기"):
+                if live["agri"]:
+                    st.markdown("**🌾 농축수산물 (KAMIS · EKAPE)**")
+                    st.dataframe(live["agri"]["detail"], use_container_width=True,
+                                 hide_index=True)
+                if live["petro"]:
+                    st.markdown("**⛽ 석유제품 (오피넷)**")
+                    st.dataframe(live["petro"]["detail"], use_container_width=True,
+                                 hide_index=True)
+                
+        for _err in live.get("errors", []):
+            st.warning(f"⚠️ 수집 실패 — {_err}")
+
+        st.markdown("")
+
         last_agri_mom = float(hist_mom_all['농축수산물'].iloc[-1]) if '농축수산물' in hist_mom_all.columns else 0.0
         st.caption("🔗 [KAMIS 소매가격 확인](https://www.kamis.or.kr/customer/price/agricultureRetail/catalogue.do)")
         agri_col1, agri_col2 = st.columns([3, 1])
         with agri_col1:
             st.slider(
                 "농축수산물 예상 등락률 (MoM %)",
-                min_value=-3.0, max_value=3.0, step=0.001, format="%.3f",
+                min_value=-5.0, max_value=5.0, step=0.001, format="%.3f",
                 key="agri_val_slider",
                 on_change=sync_agri_from_slider,
-                help=f"직전월 농축수산물 상승률(MoM)은 {last_agri_mom:.2f}% 이었습니다."
+                help=(f"직전월 농축수산물 상승률(MoM)은 {last_agri_mom:.2f}% 이었습니다."
+                      + (f" / 실시간 수집값 {DEFAULT_AGRI:+.3f}%" if live["agri"] else ""))
             )
         with agri_col2:
             st.number_input(
                 "직접 입력",
-                min_value=-3.0, max_value=3.0, step=0.001, format="%.3f",
+                min_value=-5.0, max_value=5.0, step=0.001, format="%.3f",
                 key="agri_val_exact",
                 on_change=sync_agri_from_exact
             )
@@ -764,22 +919,19 @@ with tab2:
         with petro_col1:
             st.slider(
                 "석유제품 예상 등락률 (MoM %)",
-                min_value=-3.0, max_value=3.0, step=0.001, format="%.3f",
+                min_value=-10.0, max_value=10.0, step=0.001, format="%.3f",
                 key="petro_val_slider",
                 on_change=sync_petro_from_slider,
-                help=f"직전월 석유제품 상승률(MoM)은 {last_petro_mom:.2f}% 이었습니다."
+                help=(f"직전월 석유제품 상승률(MoM)은 {last_petro_mom:.2f}% 이었습니다."
+                      + (f" / 실시간 수집값 {DEFAULT_PETRO:+.3f}%" if live["petro"] else ""))
             )
         with petro_col2:
             st.number_input(
                 "직접 입력",
-                min_value=-3.0, max_value=3.0, step=0.001, format="%.3f",
+                min_value=-10.0, max_value=10.0, step=0.001, format="%.3f",
                 key="petro_val_exact",
                 on_change=sync_petro_from_exact
             )
-
-       
-        fx_mom = 0.0
-        
 
     with col_right:
         st.subheader("📈 2. 추세적 품목 예상치")
@@ -821,16 +973,16 @@ with tab2:
     # ------------------------------------------
     # 🧮 환율 효과 및 인덱스 예측 연산 시동
     # ------------------------------------------
-    pred_indices = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
+    pred_indices = compute_tab2_pred_indices(last_row, rec_values, st.session_state)
     st.caption(f"📌 현재 기준: {current_model}")
         
 
     # 가중치 합산 기반 총지수 도출
-    # 가중치 정보가 cpi_weights 에 존재하므로 호출하여 계산
+    # 가중치 정보는 워킹 소스 weights(=st.session_state["weights"]) 에서 조회
     w_sum = 0.0
     w_index_product = 0.0
-    
-    component_weights = normalize_component_weights(cpi_weights, total_index_items)
+
+    component_weights = normalize_component_weights(weights, total_index_items)
     for item in total_index_items:
         w = component_weights.get(item, 0.0)
         w_index_product += pred_indices[item] * w
@@ -848,7 +1000,7 @@ with tab2:
         set(df_hist.columns),
         ['이외공업제품', '전기수도가스', '집세', '공공서비스', '개인서비스']
     )
-    core_component_weights = {item: float(cpi_weights.get(item, 0.0)) for item in core_component_items_resolved}
+    core_component_weights = {item: float(weights.get(item, 0.0)) for item in core_component_items_resolved}
     core_weight_total = sum(core_component_weights.values())
     core_pred_index = 0.0
     if core_weight_total > 0:
@@ -1048,7 +1200,7 @@ with tab3:
     extended_dates = [df_hist.index[-1]] + future_dates
     
     # 탭2의 현재 사용자 조정값을 기준으로 최신 예측값 재계산
-    pred_indices = compute_tab2_pred_indices(last_row, rec_values, st.session_state, base_fx)
+    pred_indices = compute_tab2_pred_indices(last_row, rec_values, st.session_state)
 
     col_exog_title, col_exog_reset = st.columns([5, 1])
     with col_exog_title:
@@ -1100,7 +1252,7 @@ with tab3:
     target_items = [item for item in total_index_items if item in df_hist.columns]
 
     sim_indices_dict = {k: [last_row[k]] for k in target_items}
-    component_weights = normalize_component_weights(cpi_weights, target_items)
+    component_weights = normalize_component_weights(weights, target_items)
     monthly_avg_growths = build_monthly_avg_growths(hist_mom_all, target_items)
     
 
@@ -1149,7 +1301,7 @@ with tab3:
     )
     core_hist_series = get_core_history_series(df_hist)
     core_sim_indices_dict = {k: [last_row[k]] for k in core_target_items}
-    core_component_weights = {item: float(cpi_weights.get(item, 0.0)) for item in core_target_items}
+    core_component_weights = {item: float(weights.get(item, 0.0)) for item in core_target_items}
     core_monthly_avg_growths = build_monthly_avg_growths(hist_mom_all, core_target_items)
 
     for i, f_date in enumerate(future_dates):
