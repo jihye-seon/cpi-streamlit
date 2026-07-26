@@ -18,12 +18,16 @@
 """
 
 import io
+import os
 import re
 import sys
 from datetime import date, timedelta
 
 import pandas as pd
 import requests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from net_utils import make_session
 
 BASE = "https://www.opinet.co.kr"
 
@@ -68,10 +72,7 @@ WEIGHTS = {
 # ----------------------------------------------------------------------
 def _session(page_url: str) -> requests.Session:
     """조회 페이지를 먼저 열어 세션 쿠키/Referer를 확보한 Session 반환."""
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Referer": page_url})
-    s.get(page_url, timeout=20)
-    return s
+    return make_session(referer=page_url, warm_url=page_url)
 
 
 def _hidden_fields(session: requests.Session, page_url: str) -> dict:

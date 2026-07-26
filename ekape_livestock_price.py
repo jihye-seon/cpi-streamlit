@@ -21,6 +21,7 @@
 산출      : 축종별 당월평균, 전월평균, MoM 등락률(%)
 """
 
+import os
 import re
 import sys
 import time
@@ -29,6 +30,9 @@ from io import StringIO
 
 import pandas as pd
 import requests
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from net_utils import make_session
 
 BASE = "https://www.ekapepia.com"
 PRICE_URL = f"{BASE}/v3/price/consumer/periodPrice.do"
@@ -60,10 +64,8 @@ REQUEST_DELAY = 0.3  # 서버 부담을 줄이기 위한 요청 간 간격(초)
 # ----------------------------------------------------------------------
 def _session() -> requests.Session:
     """조회 페이지를 먼저 열어 세션 쿠키를 확보한 Session 반환."""
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Referer": PRICE_URL})
-    s.get(PRICE_URL, params={"menuSn": MENU_SN, "boardInfoNo": ""}, timeout=25)
-    return s
+    return make_session(referer=PRICE_URL,
+                        warm_url=f"{PRICE_URL}?menuSn={MENU_SN}&boardInfoNo=")
 
 
 def _ym_str(y: int, m: int) -> str:
