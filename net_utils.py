@@ -34,8 +34,19 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+# 배포된 파일이 최신인지 앱에서 바로 확인하기 위한 표식
+VERSION = "2026-07-28.3"
+
 # OpenSSL 3.x에만 있는 옵션이라 없는 환경에서는 0으로 떨어뜨린다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+
+# 서버가 받아주는 조합을 찾을 때까지 순서대로 시도할 암호군 설정
+CIPHER_LADDER = [
+    ("표준", None),
+    ("SECLEVEL=1", "DEFAULT:@SECLEVEL=1"),
+    ("SECLEVEL=0", "DEFAULT:@SECLEVEL=0"),
+    ("ALL SECLEVEL=0", "ALL:@SECLEVEL=0"),
+]
 
 # 폴백이 걸린 내역을 모아 두고 앱에서 표시한다
 _GLOBAL_NOTES = []
@@ -59,14 +70,17 @@ class LegacyTLSAdapter(HTTPAdapter):
     최후 수단이며, 통신은 여전히 암호화되지만 중간자 공격은 막지 못한다.
     """
 
-    def __init__(self, *args, insecure: bool = False, **kwargs):
+    def __init__(self, *args, insecure: bool = False,
+                 ciphers: str = "DEFAULT:@SECLEVEL=1", **kwargs):
         self._insecure = insecure
+        self._ciphers = ciphers
         super().__init__(*args, **kwargs)
 
     def _context(self):
-        ctx = create_urllib3_context(ciphers="DEFAULT@SECLEVEL=1")
+        # minimum_version은 일부러 건드리지 않는다. 지정하면 환경에 따라
+        # 협상 가능한 조합이 오히려 좁아져 handshake_failure가 나기도 한다.
+        ctx = create_urllib3_context(ciphers=self._ciphers)
         ctx.options |= _OP_LEGACY_SERVER_CONNECT
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if self._insecure:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -90,9 +104,10 @@ class ResilientSession(requests.Session):
                  allow_insecure: bool = True, start_relaxed: bool = True,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self._stage = 0               # 0=표준 1=완화 2=검증생략
         self._allow_http = allow_http_fallback
         self._allow_insecure = allow_insecure
+        self._insecure_on = False
+        self._ciphers = None
         self._downgraded = set()      # http로 내려 붙기로 확정한 호스트
         self.notes = []               # 어떤 경로로 통했는지 기록 (UI 표시용)
 
@@ -108,14 +123,16 @@ class ResilientSession(requests.Session):
         # 처음부터 이 설정으로 시작하는 편이 안전하고 결과도 동일하다.
         # (TLS1.3을 지원하는 서버는 완화 설정에서도 그대로 TLS1.3으로 붙는다)
         if start_relaxed:
-            self._mount_stage(1)
+            self._mount(ciphers="DEFAULT:@SECLEVEL=1", insecure=False)
 
     # -- 내부 헬퍼 ---------------------------------------------------
-    def _mount_stage(self, stage: int):
-        """1=암호군 완화, 2=완화 + 인증서 검증 생략"""
-        self.mount("https://", LegacyTLSAdapter(insecure=(stage >= 2),
+    def _mount(self, ciphers: str, insecure: bool):
+        """지정한 암호군/검증설정으로 HTTPS 어댑터를 갈아끼운다."""
+        self.mount("https://", LegacyTLSAdapter(insecure=insecure,
+                                                ciphers=ciphers,
                                                 max_retries=self._retry))
-        self._stage = stage
+        self._ciphers = ciphers
+        self._insecure_on = insecure
 
     @staticmethod
     def _to_http(url: str) -> str:
@@ -135,43 +152,43 @@ class ResilientSession(requests.Session):
         if host in self._downgraded and url.startswith("https://"):
             return super().request(method, self._to_http(url), **kwargs)
 
-        # 이미 검증 생략 단계면 verify 인자를 맞춰 준다
-        if self._stage >= 2:
+        if self._insecure_on:
             kwargs.setdefault("verify", False)
 
         try:
             return super().request(method, url, **kwargs)
         except requests.exceptions.SSLError as first_err:
             err = first_err
+            plain = {k: v for k, v in kwargs.items() if k != "verify"}
 
-            # 1단계: OpenSSL 보안수준을 낮춰 재시도
-            #        (KAMIS는 SHA1 CBC 암호군만 받아들여 SECLEVEL=2에서 거절됨)
-            if self._stage < 1:
-                self._mount_stage(1)
+            # 1단계: 암호군 사다리를 순서대로 내려가며 재시도
+            for label, ciphers in CIPHER_LADDER:
+                if ciphers is None or ciphers == self._ciphers:
+                    continue
+                self._mount(ciphers=ciphers, insecure=self._insecure_on)
                 try:
                     resp = super().request(method, url, **kwargs)
-                    self._note(f"{host}: TLS 암호군 완화(SECLEVEL=1)로 접속")
+                    self._note(f"{host}: TLS 암호군 {label}로 접속")
                     return resp
                 except requests.exceptions.SSLError as e:
                     err = e
 
             # 2단계: 인증서 체인이 끊긴 경우 검증을 생략하고 재시도
-            if self._allow_insecure and self._stage < 2:
-                self._mount_stage(2)
-                try:
-                    resp = super().request(method, url, verify=False,
-                                           **{k: v for k, v in kwargs.items()
-                                              if k != "verify"})
-                    self._note(f"⚠️ {host}: 서버 인증서 체인 불완전 → 검증 생략하고 접속")
-                    return resp
-                except requests.exceptions.SSLError as e:
-                    err = e
+            if self._allow_insecure and not self._insecure_on:
+                for label, ciphers in CIPHER_LADDER:
+                    self._mount(ciphers=ciphers or "DEFAULT", insecure=True)
+                    try:
+                        resp = super().request(method, url, verify=False, **plain)
+                        self._note(f"⚠️ {host}: 인증서 검증 생략({label})으로 접속")
+                        return resp
+                    except requests.exceptions.SSLError as e:
+                        err = e
 
             # 3단계: 그래도 안 되면 평문 HTTP로 시도
             #        (443 포트가 막혀도 80 포트는 열려 있는 경우가 있다)
             if self._allow_http and url.startswith("https://"):
                 try:
-                    resp = super().request(method, self._to_http(url), **kwargs)
+                    resp = super().request(method, self._to_http(url), **plain)
                     self._downgraded.add(host)
                     self._note(f"⚠️ {host}: HTTPS 실패 → HTTP(80)로 우회")
                     return resp
@@ -259,16 +276,37 @@ def diagnose_host(url: str, timeout: int = 10) -> dict:
         except Exception as e:
             out[label] = f"실패 — {type(e).__name__}"
 
-    # 5) HTTPS GET / 6) HTTP GET
+    # 5) 실제 requests 경로 — raw 소켓이 되는데 여기서 막히는 경우가 있어
+    #    같은 조건으로 반드시 함께 확인한다
     headers = {"User-Agent": DEFAULT_UA}
-    for label, target in (("HTTPS GET", url),
-                          ("HTTP GET", "http://" + url.split("://", 1)[1])):
+    for label, ciphers in CIPHER_LADDER:
         try:
-            r = requests.get(target, headers=headers, timeout=timeout,
-                             allow_redirects=False)
-            out[label] = f"HTTP {r.status_code}"
+            s = requests.Session()
+            s.headers.update(headers)
+            if ciphers:
+                s.mount("https://", LegacyTLSAdapter(ciphers=ciphers))
+            r = s.get(url, timeout=timeout, allow_redirects=False)
+            out[f"requests({label})"] = f"HTTP {r.status_code}"
         except Exception as e:
-            out[label] = f"실패 — {type(e).__name__}"
+            out[f"requests({label})"] = f"실패 — {type(e).__name__}"
+
+    # 6) 최종 폴백까지 포함한 세션
+    try:
+        s = make_session(referer=url)
+        r = s.get(url, timeout=timeout)
+        out["ResilientSession"] = f"HTTP {r.status_code}"
+        out["폴백경로"] = "; ".join(s.notes) or "폴백 없이 성공"
+    except Exception as e:
+        out["ResilientSession"] = f"실패 — {type(e).__name__}"
+        out["폴백경로"] = "-"
+
+    # 7) 평문 HTTP
+    try:
+        r = requests.get("http://" + url.split("://", 1)[1], headers=headers,
+                         timeout=timeout, allow_redirects=False)
+        out["HTTP GET"] = f"HTTP {r.status_code}"
+    except Exception as e:
+        out["HTTP GET"] = f"실패 — {type(e).__name__}"
 
     return out
 

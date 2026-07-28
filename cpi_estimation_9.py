@@ -949,12 +949,16 @@ with tab2:
             st.caption(f"🔐 접속 경로 — {_note}")
 
         with st.expander("🔧 연결 진단 (수집이 실패할 때 원인 확인)"):
-            st.caption("각 사이트에 대해 DNS → TCP → TLS → HTTP 순으로 어느 단계에서 "
-                       "막히는지 확인합니다. TLS(기본)만 실패하고 TLS(완화)가 통하면 "
-                       "OpenSSL 보안수준 문제이며 코드가 자동 우회합니다.")
+            if LIVE_MODULES_OK:
+                import net_utils
+                import ssl as _ssl
+                st.caption(f"net_utils {getattr(net_utils, 'VERSION', '구버전 — 재배포 필요')} · "
+                           f"{_ssl.OPENSSL_VERSION}")
+            st.caption("raw 소켓(TLS...)과 실제 통신 경로(requests...)를 같은 조건으로 "
+                       "비교합니다. `ResilientSession` 행이 HTTP 200이면 수집이 정상 "
+                       "동작하는 상태입니다.")
             if st.button("진단 실행", key="run_diag"):
                 if LIVE_MODULES_OK:
-                    import net_utils
                     st.dataframe(pd.DataFrame(net_utils.diagnose_all()),
                                  use_container_width=True, hide_index=True)
                 else:
