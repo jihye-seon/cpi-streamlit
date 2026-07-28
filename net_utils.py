@@ -87,7 +87,8 @@ class ResilientSession(requests.Session):
     """SSL 핸드셰이크 실패 시 완화된 TLS 설정으로 한 번 더 시도하는 세션."""
 
     def __init__(self, *args, allow_http_fallback: bool = True,
-                 allow_insecure: bool = True, **kwargs):
+                 allow_insecure: bool = True, start_relaxed: bool = True,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self._stage = 0               # 0=표준 1=완화 2=검증생략
         self._allow_http = allow_http_fallback
@@ -95,16 +96,25 @@ class ResilientSession(requests.Session):
         self._downgraded = set()      # http로 내려 붙기로 확정한 호스트
         self.notes = []               # 어떤 경로로 통했는지 기록 (UI 표시용)
 
-        retry = Retry(total=2, backoff_factor=0.5,
-                      status_forcelist=[429, 500, 502, 503, 504],
-                      allowed_methods=["GET", "POST"])
+        self._retry = Retry(total=2, backoff_factor=0.5,
+                            status_forcelist=[429, 500, 502, 503, 504],
+                            allowed_methods=["GET", "POST"])
         for prefix in ("http://", "https://"):
-            self.mount(prefix, HTTPAdapter(max_retries=retry))
+            self.mount(prefix, HTTPAdapter(max_retries=self._retry))
+
+        # 실패를 겪은 뒤에 어댑터를 갈아끼우는 방식은 세션 워밍업·리다이렉트·
+        # 커넥션 풀 재사용이 얽히면 타이밍이 어긋날 수 있다. SECLEVEL=1은
+        # 인증서 검증을 그대로 유지하면서 구형 암호군만 추가로 허용하므로,
+        # 처음부터 이 설정으로 시작하는 편이 안전하고 결과도 동일하다.
+        # (TLS1.3을 지원하는 서버는 완화 설정에서도 그대로 TLS1.3으로 붙는다)
+        if start_relaxed:
+            self._mount_stage(1)
 
     # -- 내부 헬퍼 ---------------------------------------------------
     def _mount_stage(self, stage: int):
         """1=암호군 완화, 2=완화 + 인증서 검증 생략"""
-        self.mount("https://", LegacyTLSAdapter(insecure=(stage >= 2)))
+        self.mount("https://", LegacyTLSAdapter(insecure=(stage >= 2),
+                                                max_retries=self._retry))
         self._stage = stage
 
     @staticmethod
@@ -172,14 +182,16 @@ class ResilientSession(requests.Session):
 
 
 def make_session(referer: str = None, warm_url: str = None,
-                 timeout: int = 25, allow_http_fallback: bool = True
-                 ) -> ResilientSession:
+                 timeout: int = 25, allow_http_fallback: bool = True,
+                 start_relaxed: bool = True) -> ResilientSession:
     """
     공용 세션 생성.
-      referer  - Referer 헤더로 넣을 주소
-      warm_url - 세션 쿠키 확보를 위해 미리 한 번 GET 할 주소
+      referer       - Referer 헤더로 넣을 주소
+      warm_url      - 세션 쿠키 확보를 위해 미리 한 번 GET 할 주소
+      start_relaxed - 처음부터 SECLEVEL=1 설정으로 붙는다 (기본값)
     """
-    s = ResilientSession(allow_http_fallback=allow_http_fallback)
+    s = ResilientSession(allow_http_fallback=allow_http_fallback,
+                         start_relaxed=start_relaxed)
     s.headers.update({"User-Agent": DEFAULT_UA})
     if referer:
         s.headers["Referer"] = referer
