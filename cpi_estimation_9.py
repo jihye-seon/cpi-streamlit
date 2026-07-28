@@ -624,13 +624,17 @@ def load_live_defaults():
     실시간 수집이 실패한 소스는 스냅샷 파일 값으로 대체한다.
     """
     out = {"petro": None, "agri": None, "errors": [],
-           "sources": {}, "fetched": True}
+           "sources": {}, "notes": [], "fetched": True}
 
     try:
         snap = load_snapshot(os.path.getmtime(SNAPSHOT_FILE)
                              if os.path.exists(SNAPSHOT_FILE) else None)
     except Exception:
         snap = None
+
+    if LIVE_MODULES_OK:
+        import net_utils
+        net_utils.clear_notes()
 
     for key, fn, label in (("petro", fetch_live_petro_mom, "석유제품"),
                            ("agri", fetch_live_agri_mom, "농축수산물")):
@@ -651,6 +655,9 @@ def load_live_defaults():
             out["errors"].append(f"{label} 실시간 수집 실패 → 스냅샷 사용 : {err}")
         else:
             out["errors"].append(f"{label}: {err}")
+
+    if LIVE_MODULES_OK:
+        out["notes"] = net_utils.get_notes()
 
     return out
 
@@ -937,6 +944,21 @@ with tab2:
                 
         for _err in live.get("errors", []):
             st.warning(f"⚠️ 수집 실패 — {_err}")
+
+        for _note in live.get("notes", []):
+            st.caption(f"🔐 접속 경로 — {_note}")
+
+        with st.expander("🔧 연결 진단 (수집이 실패할 때 원인 확인)"):
+            st.caption("각 사이트에 대해 DNS → TCP → TLS → HTTP 순으로 어느 단계에서 "
+                       "막히는지 확인합니다. TLS(기본)만 실패하고 TLS(완화)가 통하면 "
+                       "OpenSSL 보안수준 문제이며 코드가 자동 우회합니다.")
+            if st.button("진단 실행", key="run_diag"):
+                if LIVE_MODULES_OK:
+                    import net_utils
+                    st.dataframe(pd.DataFrame(net_utils.diagnose_all()),
+                                 use_container_width=True, hide_index=True)
+                else:
+                    st.error(f"수집 모듈을 불러올 수 없습니다: {LIVE_IMPORT_ERR}")
 
         st.markdown("")
 
