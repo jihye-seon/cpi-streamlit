@@ -32,10 +32,30 @@ from urllib3.util.ssl_ import create_urllib3_context
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# User-Agent만 보내면 국내 WAF가 봇으로 판단해 406/403을 돌려주는 경우가 있다.
+# 브라우저가 실제로 보내는 헤더를 최대한 흉내낸다.
+BROWSER_HEADERS = {
+    "User-Agent": DEFAULT_UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
 
 # 배포된 파일이 최신인지 앱에서 바로 확인하기 위한 표식
-VERSION = "2026-07-28.3"
+VERSION = "2026-07-30.1"
 
 # OpenSSL 3.x에만 있는 옵션이라 없는 환경에서는 0으로 떨어뜨린다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
@@ -209,9 +229,11 @@ def make_session(referer: str = None, warm_url: str = None,
     """
     s = ResilientSession(allow_http_fallback=allow_http_fallback,
                          start_relaxed=start_relaxed)
-    s.headers.update({"User-Agent": DEFAULT_UA})
+    s.headers.update(BROWSER_HEADERS)
     if referer:
         s.headers["Referer"] = referer
+        parts = urlparse(referer)
+        s.headers["Origin"] = f"{parts.scheme}://{parts.netloc}"
 
     if warm_url:
         try:
@@ -276,17 +298,18 @@ def diagnose_host(url: str, timeout: int = 10) -> dict:
         except Exception as e:
             out[label] = f"실패 — {type(e).__name__}"
 
-    # 5) 실제 requests 경로 — raw 소켓이 되는데 여기서 막히는 경우가 있어
-    #    같은 조건으로 반드시 함께 확인한다
-    headers = {"User-Agent": DEFAULT_UA}
-    for label, ciphers in CIPHER_LADDER:
+    # 5) 헤더 구성별 비교 — TLS는 통과하는데 WAF가 봇으로 보고 막는 경우를 가른다
+    body = None
+    for label, headers in (("UA만", {"User-Agent": DEFAULT_UA}),
+                           ("브라우저헤더", BROWSER_HEADERS)):
         try:
             s = requests.Session()
             s.headers.update(headers)
-            if ciphers:
-                s.mount("https://", LegacyTLSAdapter(ciphers=ciphers))
+            s.mount("https://", LegacyTLSAdapter(ciphers="DEFAULT:@SECLEVEL=1"))
             r = s.get(url, timeout=timeout, allow_redirects=False)
             out[f"requests({label})"] = f"HTTP {r.status_code}"
+            if r.status_code != 200 and body is None:
+                body = r.text[:200].replace("\n", " ").strip()
         except Exception as e:
             out[f"requests({label})"] = f"실패 — {type(e).__name__}"
 
@@ -296,24 +319,52 @@ def diagnose_host(url: str, timeout: int = 10) -> dict:
         r = s.get(url, timeout=timeout)
         out["ResilientSession"] = f"HTTP {r.status_code}"
         out["폴백경로"] = "; ".join(s.notes) or "폴백 없이 성공"
+        if r.status_code != 200 and body is None:
+            body = r.text[:200].replace("\n", " ").strip()
     except Exception as e:
         out["ResilientSession"] = f"실패 — {type(e).__name__}"
         out["폴백경로"] = "-"
 
     # 7) 평문 HTTP
     try:
-        r = requests.get("http://" + url.split("://", 1)[1], headers=headers,
-                         timeout=timeout, allow_redirects=False)
+        r = requests.get("http://" + url.split("://", 1)[1],
+                         headers=BROWSER_HEADERS, timeout=timeout,
+                         allow_redirects=False)
         out["HTTP GET"] = f"HTTP {r.status_code}"
     except Exception as e:
         out["HTTP GET"] = f"실패 — {type(e).__name__}"
 
+    # 차단 페이지 본문 일부 — 해외IP 차단 안내인지 확인용
+    out["응답본문"] = body or ""
+
     return out
 
 
+def _kamis_api_probe_url() -> str:
+    """
+    인증키와 정상 파라미터를 갖춘 KAMIS OpenAPI 주소.
+
+    파라미터 없이 호출하면 서버가 정상적으로 404를 주기 때문에, 그것만으로는
+    WAF 차단인지 아닌지 구분할 수 없다. 실제 호출로 확인해야 판별이 된다.
+    """
+    from urllib.parse import urlencode
+    try:
+        from kamis_retail_price import KAMIS_KEY, KAMIS_ID
+    except Exception:
+        return None
+
+    params = {
+        "action": "dailyPriceByCategoryList",
+        "p_cert_key": KAMIS_KEY, "p_cert_id": KAMIS_ID,
+        "p_returntype": "json", "p_product_cls_code": "01",
+        "p_item_category_code": "100", "p_country_code": "1101",
+        "p_convert_kg_yn": "N",
+    }
+    return "https://www.kamis.or.kr/service/price/xml.do?" + urlencode(params)
+
+
 DIAGNOSE_TARGETS = [
-    ("KAMIS", "https://www.kamis.or.kr/customer/price/agricultureRetail/catalogue.do"),
-    ("KAMIS API", "https://www.kamis.or.kr/service/price/xml.do"),
+    ("KAMIS 화면", "https://www.kamis.or.kr/customer/price/agricultureRetail/catalogue.do"),
     ("EKAPE", "https://www.ekapepia.com/v3/price/consumer/periodPrice.do"),
     ("오피넷", "https://www.opinet.co.kr/user/dopospdrg/dopOsPdrgSelect.do"),
 ]
@@ -321,5 +372,15 @@ DIAGNOSE_TARGETS = [
 
 def diagnose_all(timeout: int = 10) -> list:
     """수집에 쓰는 모든 호스트를 진단해 리스트로 반환."""
-    return [dict(대상=name, **diagnose_host(url, timeout))
-            for name, url in DIAGNOSE_TARGETS]
+    targets = list(DIAGNOSE_TARGETS)
+
+    api_url = _kamis_api_probe_url()
+    if api_url:
+        targets.insert(1, ("KAMIS API(실호출)", api_url))
+
+    rows = []
+    for name, url in targets:
+        row = dict(대상=name, **diagnose_host(url, timeout))
+        row["url"] = row["url"].split("?")[0]      # 인증키는 표에 노출하지 않는다
+        rows.append(row)
+    return rows
