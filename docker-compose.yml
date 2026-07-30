@@ -1,0 +1,14 @@
+services:
+  cpi-dashboard:
+    build: .
+    image: cpi-dashboard
+    container_name: cpi-dashboard
+    restart: unless-stopped
+    ports:
+      # 사내망에만 노출할 경우 "127.0.0.1:8501:8501" 로 바꾸고 nginx를 앞에 둔다
+      - "8501:8501"
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      # 엑셀을 교체할 때 이미지 재빌드 없이 반영되도록 마운트
+      - ./CPI data_202605_v1.xlsx:/app/CPI data_202605_v1.xlsx:ro
