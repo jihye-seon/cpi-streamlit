@@ -55,7 +55,7 @@ BROWSER_HEADERS = {
 }
 
 # 배포된 파일이 최신인지 앱에서 바로 확인하기 위한 표식
-VERSION = "2026-07-30.1"
+VERSION = "2026-07-30.2"
 
 # OpenSSL 3.x에만 있는 옵션이라 없는 환경에서는 0으로 떨어뜨린다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
@@ -367,6 +367,8 @@ DIAGNOSE_TARGETS = [
     ("KAMIS 화면", "https://www.kamis.or.kr/customer/price/agricultureRetail/catalogue.do"),
     ("EKAPE", "https://www.ekapepia.com/v3/price/consumer/periodPrice.do"),
     ("오피넷", "https://www.opinet.co.kr/user/dopospdrg/dopOsPdrgSelect.do"),
+    # KAMIS가 해외 IP를 막을 경우의 대안. 호스트가 완전히 달라 별도 정책을 탄다.
+    ("공공데이터포털", "https://apis.data.go.kr"),
 ]
 
 
