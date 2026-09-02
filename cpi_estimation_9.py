@@ -167,7 +167,10 @@ def _unique_preserve(seq):
             out.append(x)
     return out
 
-all_display_items = _unique_preserve(['총지수', 'Core'] + volatile_items + ['가공식품', '이외공업제품'] + core_items)
+# 생활물가(CPI_Data 시트 N열)는 별도 집계 지표이므로 존재할 때만 Core 우측에 표시한다.
+LIVING_COST_ITEM = '생활물가'
+_display_head = ['총지수', 'Core'] + ([LIVING_COST_ITEM] if LIVING_COST_ITEM in df_hist.columns else [])
+all_display_items = _unique_preserve(_display_head + volatile_items + ['가공식품', '이외공업제품'] + core_items)
 
 BEST_ORDERS = {
     '이외공업제품': {'order': (0, 1, 2), 'seasonal_order': (0, 0, 0, 12)},
@@ -563,23 +566,31 @@ def _clamp(x, lo, hi):
     return float(min(max(x, lo), hi))
 
 
-@st.cache_data(ttl=3600, show_spinner="🌐 오피넷에서 석유제품 가격을 가져오는 중...")
-def fetch_live_petro_mom():
-    """오피넷 일별 가격 -> 석유류 가중합산 MoM(%)"""
-    r = opinet_src.get_price_mom(verbose=False)
-    months = [str(i) for i in r["monthly"].index]
+# 실시간 수집의 기준월 = 추정 대상월 (엑셀 최신월 + 1개월)
+LIVE_TARGET_YM = target_date.strftime("%Y-%m")
+
+
+# show_spinner를 끄고 load_live_defaults()에서 하나의 스피너로 묶는다.
+# (두 수집을 스레드로 동시에 돌리므로 각자 스피너를 띄우면 화면이 어지럽다)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_petro_mom(target_ym=None):
+    """오피넷 일별 가격 -> 석유류 가중합산 MoM(%) (기준월 = target_ym)"""
+    r = opinet_src.get_price_mom(target_ym=target_ym, verbose=False)
     return {
         "mom": float(r["group_mom"]),
-        "curr": months[-1],
-        "prev": months[-2],
+        "curr": r["target_ym"],
+        "prev": r["prev_ym"],
+        "base_date": str(r["base_date"]),
+        "is_partial": bool(r["is_partial"]),
         "detail": r["weighted"].reset_index(),
     }
 
 
-@st.cache_data(ttl=3600, show_spinner="🌐 KAMIS·EKAPE에서 농축수산물 가격을 가져오는 중...")
-def fetch_live_agri_mom():
-    """KAMIS 농·수산물 + EKAPE 축산물 -> 농축수산물 가중합산 MoM(%)"""
-    r = kamis_src.get_price_mom(verbose=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_agri_mom(target_ym=None):
+    """KAMIS 농·수산물 + EKAPE 축산물 -> 농축수산물 가중합산 MoM(%) (기준월 = target_ym)"""
+    ty, tm = opinet_src.parse_target_ym(target_ym) if target_ym else (None, None)
+    r = kamis_src.get_price_mom(year=ty, month=tm, verbose=False)
     y, m = r["year"], r["month"]
     py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
     return {
@@ -587,6 +598,7 @@ def fetch_live_agri_mom():
         "mom_actual": float(r["group_mom_actual"]),
         "curr": f"{y}-{m:02d}",
         "prev": f"{py}-{pm:02d}",
+        "is_partial": bool(r["is_partial"]),
         "coverage": r["coverage"],
         "survey_date": r.get("survey_date"),
         "detail": r["weighted"],
@@ -618,6 +630,44 @@ def load_snapshot(file_mtime=None):
     return snap
 
 
+def _run_parallel(tasks: dict) -> dict:
+    """
+    {키: 호출가능} 을 각각 스레드로 동시에 실행하고 {키: (결과, 예외)} 를 반환한다.
+
+    수집 시간의 대부분이 외부 사이트 응답 대기라 겹쳐 돌리면 그만큼 짧아진다.
+    Streamlit 캐시(@st.cache_data)를 워커 스레드에서 호출하므로 스크립트 실행
+    컨텍스트를 함께 넘겨준다. 없으면 경고만 나고 동작에는 지장이 없다.
+    """
+    import threading
+
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        ctx = get_script_run_ctx()
+    except Exception:                      # 스트림릿 버전에 따라 경로가 다를 수 있다
+        add_script_run_ctx, ctx = None, None
+
+    out = {}
+
+    def _runner(key, fn):
+        try:
+            out[key] = (fn(), None)
+        except Exception as e:
+            out[key] = (None, e)
+
+    threads = []
+    for key, fn in tasks.items():
+        t = threading.Thread(target=_runner, args=(key, fn), daemon=True)
+        if add_script_run_ctx is not None and ctx is not None:
+            add_script_run_ctx(t, ctx)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    return out
+
+
 def load_live_defaults():
     """
     두 소스를 각각 독립적으로 수집한다. 한쪽이 실패해도 다른 쪽은 살린다.
@@ -632,21 +682,27 @@ def load_live_defaults():
     except Exception:
         snap = None
 
+    results = {}
     if LIVE_MODULES_OK:
         import net_utils
         net_utils.clear_notes()
 
-    for key, fn, label in (("petro", fetch_live_petro_mom, "석유제품"),
-                           ("agri", fetch_live_agri_mom, "농축수산물")):
+        # 오피넷과 KAMIS·EKAPE는 서로 다른 사이트라 동시에 받아도 무방하다
+        results = _run_parallel({
+            "petro": lambda: fetch_live_petro_mom(LIVE_TARGET_YM),
+            "agri": lambda: fetch_live_agri_mom(LIVE_TARGET_YM),
+        })
+
+    for key, label in (("petro", "석유제품"), ("agri", "농축수산물")):
         if not LIVE_MODULES_OK:
             err = f"수집 모듈 로드 실패: {LIVE_IMPORT_ERR}"
         else:
-            try:
-                out[key] = fn()
+            value, exc = results.get(key, (None, RuntimeError("수집이 실행되지 않았습니다.")))
+            if exc is None:
+                out[key] = value
                 out["sources"][key] = "실시간"
                 continue
-            except Exception as e:
-                err = str(e)
+            err = str(exc)
 
         # 실시간 실패 -> 스냅샷 폴백
         if snap and snap.get(key):
@@ -676,11 +732,21 @@ def apply_live_to_inputs(data):
         st.session_state.petro_val_exact = v
 
 
-def refresh_live_prices():
-    """캐시를 비우고 다시 수집한 뒤 입력값에 반영한다."""
-    fetch_live_petro_mom.clear()
-    fetch_live_agri_mom.clear()
-    data = load_live_defaults()
+def refresh_live_prices(force: bool = False):
+    """
+    수집 결과를 입력값에 반영한다.
+
+    force=False(기본)이면 1시간 캐시(@st.cache_data ttl)를 그대로 활용하므로
+    같은 세션에서 다시 눌렀을 때 네트워크 대기 없이 즉시 반영된다.
+    force=True면 캐시를 비우고 사이트에서 새로 받아온다.
+    """
+    if force:
+        fetch_live_petro_mom.clear()
+        fetch_live_agri_mom.clear()
+
+    with st.spinner("🌐 오피넷 · KAMIS · EKAPE에서 실시간 시세를 가져오는 중..."):
+        data = load_live_defaults()
+
     st.session_state["live"] = data
     apply_live_to_inputs(data)
 
@@ -884,19 +950,27 @@ with tab2:
         target_lbl = target_date.strftime('%Y-%m')
 
         # ---- 실시간 시세 (버튼 클릭 시에만 수집) ----
-        fetch_col, note_col = st.columns([1, 2])
+        fetch_col, again_col, note_col = st.columns([1.3, 1, 2])
         with fetch_col:
             if st.button("🌐 실시간 시세 가져오기", use_container_width=True,
                          type="primary" if not live.get("fetched") else "secondary",
                          key="fetch_live_tab2"):
                 refresh_live_prices()
                 st.rerun()
+        with again_col:
+            # 캐시가 살아 있는 동안 다시 받고 싶을 때만 쓰는 버튼
+            if live.get("fetched") and st.button(
+                    "🔁 새로 수집", use_container_width=True, key="force_live_tab2",
+                    help="1시간 캐시를 무시하고 각 사이트에서 다시 받아옵니다."):
+                refresh_live_prices(force=True)
+                st.rerun()
         with note_col:
             if live.get("fetched"):
-                st.caption("오피넷 · KAMIS · EKAPE에서 수집한 값이 아래 입력값에 반영되었습니다.")
+                st.caption("오피넷 · KAMIS · EKAPE에서 수집한 값이 아래 입력값에 "
+                           "반영되었습니다. 수집 결과는 1시간 동안 재사용됩니다.")
             else:
                 st.caption("버튼을 누르면 각 사이트에서 당월 MoM을 수집해 "
-                           "아래 입력값에 자동 반영합니다 (30~40초).")
+                           "아래 입력값에 자동 반영합니다 (10초 안팎).")
 
         if live.get("agri") or live.get("petro"):
             info_cols = st.columns(2)
@@ -904,23 +978,30 @@ with tab2:
             if live["agri"]:
                 a = live["agri"]
                 cov = a["coverage"].get("가중치 커버리지(%)", float('nan'))
+                if a.get("is_partial"):
+                    _a_scope = f"월중 부분 평균(속보치), 조사일 {a.get('survey_date') or '-'}"
+                else:
+                    _a_scope = "월 전체 평균"
                 info_cols[0].metric(
                     f"🌾 농축수산물 ({a['curr']})",
                     f"{a['mom']:+.3f}%",
                     delta=f"실측만 {a['mom_actual']:+.2f}%",
                     delta_color="off",
                     help=f"KAMIS 농·수산물 + EKAPE 축산물 가중합산 "
-                         f"(가중치 커버리지 {cov:.1f}%, 조사일 {a.get('survey_date') or '-'})",
+                         f"({_a_scope}, 가중치 커버리지 {cov:.1f}%)",
                 )
                 info_cols[0].caption(f"출처: {srcs.get('agri', '-')}")
             if live["petro"]:
                 p = live["petro"]
+                _base = p.get("base_date")
+                _scope = ("월중 부분 평균(속보치)" if p.get("is_partial") else "월 전체 평균")
                 info_cols[1].metric(
                     f"⛽ 석유제품 ({p['curr']})",
                     f"{p['mom']:+.3f}%",
                     delta=f"vs {p['prev']}",
                     delta_color="off",
-                    help="오피넷 일별 가격의 월평균 기준 가중합산 MoM",
+                    help=f"오피넷 일별 가격의 월평균 기준 가중합산 MoM "
+                         f"({_scope}{f', ~{_base}' if _base else ''})",
                 )
                 info_cols[1].caption(f"출처: {srcs.get('petro', '-')}")
 
@@ -1598,6 +1679,126 @@ with tab3:
             "예상 core YoY (%)": st.column_config.NumberColumn("예상 core YoY (%)", format="%.2f%%"),
         }, use_container_width=True
     )
+
+    st.markdown("---")
+    st.subheader("📅 연간 물가 상승률 추이")
+    st.caption(
+        f"엑셀 과거 데이터의 시작 연도부터 예측 기준월({target_date.strftime('%Y-%m')}) 이후까지 연간 지수를 산출합니다. "
+        "**과거/전년도**는 확정치 월평균, **기준년도**는 확정치 + 위 표의 예측치 평균, "
+        "**익년도**는 위 표에서 산출된 월까지만 평균한 값입니다. "
+        "연간 YoY는 동일 월 구간끼리 비교합니다."
+    )
+
+    annual_sim_data = st.session_state[session_df_key]
+    # 엑셀 인덱스가 월말 기준(윤년 2/29 포함)이라 날짜 연산으로 전년 동월을 찾으면 매칭이 어긋난다.
+    # 연간 집계는 월(Period) 단위로 정규화한 시계열 위에서 계산한다.
+    future_index = pd.PeriodIndex(pd.DatetimeIndex(future_dates), freq='M')
+
+    total_hist_monthly = pd.to_numeric(df_hist[total_col], errors='coerce').dropna()
+    core_hist_monthly = get_core_history_series(df_hist).dropna()
+    total_hist_monthly.index = pd.PeriodIndex(total_hist_monthly.index, freq='M')
+    core_hist_monthly.index = pd.PeriodIndex(core_hist_monthly.index, freq='M')
+
+    def _merge_hist_and_forecast(hist_series, forecast_values):
+        merged = pd.concat([
+            hist_series,
+            pd.Series(np.asarray(forecast_values, dtype=float), index=future_index)
+        ])
+        merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+        return merged
+
+    total_monthly_full = _merge_hist_and_forecast(total_hist_monthly, annual_sim_data["예상 원지수"].values)
+    core_monthly_full = _merge_hist_and_forecast(core_hist_monthly, annual_sim_data["예상 core 원지수"].values)
+
+    def _annual_stats(series, year):
+        """해당 연도에 존재하는 월(확정+예측)만으로 연간 원지수/YoY 를 계산."""
+        if series is None or series.empty:
+            return None
+        months = [p for p in series.index if p.year == year]
+        if not months:
+            return None
+        avg_index = float(np.mean([float(series.loc[p]) for p in months]))
+
+        # 월 Period 이므로 -12 가 곧 전년 동월 (윤년 영향 없음)
+        ly_months = [p - 12 for p in months]
+        ly_vals = [float(series.loc[p]) for p in ly_months if p in series.index]
+        if len(ly_vals) == len(months) and np.mean(ly_vals) != 0:
+            yoy = (avg_index / float(np.mean(ly_vals)) - 1) * 100
+        else:
+            yoy = np.nan
+
+        return {
+            "index": avg_index,
+            "yoy": yoy,
+            "n_months": len(months),
+            "n_actual": sum(1 for p in months if p in total_hist_monthly.index),
+        }
+
+    base_year = target_date.year
+    all_years = sorted({int(d.year) for d in total_monthly_full.index} | {int(d.year) for d in core_monthly_full.index})
+
+    annual_rows = []
+    for year in all_years:
+        total_stat = _annual_stats(total_monthly_full, year)
+        core_stat = _annual_stats(core_monthly_full, year)
+        if total_stat is None and core_stat is None:
+            continue
+        ref_stat = total_stat or core_stat
+        n_actual = ref_stat["n_actual"]
+        n_pred = ref_stat["n_months"] - n_actual
+        annual_rows.append({
+            "구분": f"{year}년 (기준년도)" if year == base_year else f"{year}년",
+            "연도": year,
+            "총지수 원지수": total_stat["index"] if total_stat else np.nan,
+            "총지수 YoY (%)": total_stat["yoy"] if total_stat else np.nan,
+            "근원 원지수": core_stat["index"] if core_stat else np.nan,
+            "근원 YoY (%)": core_stat["yoy"] if core_stat else np.nan,
+            "구성": f"확정 {n_actual}M + 예측 {n_pred}M" if n_pred else f"확정 {n_actual}M",
+        })
+
+    if annual_rows:
+        df_annual = pd.DataFrame(annual_rows).set_index("구분")
+        st.dataframe(
+            df_annual.drop(columns=["연도"]),
+            column_config={
+                "총지수 원지수": st.column_config.NumberColumn("총지수 원지수", format="%.2f"),
+                "총지수 YoY (%)": st.column_config.NumberColumn("총지수 YoY (%)", format="%.2f%%"),
+                "근원 원지수": st.column_config.NumberColumn("근원 원지수", format="%.2f"),
+                "근원 YoY (%)": st.column_config.NumberColumn("근원 YoY (%)", format="%.2f%%"),
+                "구성": st.column_config.TextColumn("구성"),
+            },
+            use_container_width=True
+        )
+
+        annual_view_mode = st.radio(
+            "연간 지표 선택", ["YoY (%)", "원지수"],
+            horizontal=True, key="annual_view_mode"
+        )
+
+        df_annual_chart = df_annual
+        total_col_name = f"총지수 {annual_view_mode}"
+        core_col_name = f"근원 {annual_view_mode}"
+        y_fmt = "%{y:.2f}" if annual_view_mode == "원지수" else "%{y:.2f}%"
+
+        fig_annual = go.Figure()
+        fig_annual.add_trace(go.Scatter(
+            x=df_annual_chart.index, y=df_annual_chart[total_col_name], name="총지수",
+            mode='lines+markers+text', line=dict(color='#1f77b4', width=3),
+            marker=dict(size=8), texttemplate=y_fmt, textposition='top center'
+        ))
+        fig_annual.add_trace(go.Scatter(
+            x=df_annual_chart.index, y=df_annual_chart[core_col_name], name="근원",
+            mode='lines+markers+text', line=dict(color='#d62728', width=3, dash='dash'),
+            marker=dict(size=8), texttemplate=y_fmt, textposition='bottom center'
+        ))
+        fig_annual.update_layout(
+            xaxis_title="연도", yaxis_title=annual_view_mode,
+            hovermode="x unified", height=420,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01)
+        )
+        st.plotly_chart(fig_annual, use_container_width=True)
+    else:
+        st.info("연간 집계를 계산할 데이터가 부족합니다.")
 
     st.markdown("---")
     st.subheader(f"📉 {current_model} 기반 물가 경로")
