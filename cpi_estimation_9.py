@@ -1888,6 +1888,55 @@ with tab3:
     )
 
     st.markdown("---")
+    st.subheader(f"📉 {current_model} 기반 물가 경로")
+    path_series_mode = st.radio("데이터 종류 선택", ["총지수", "근원"], horizontal=True, key="path_series_mode")
+    path_view_mode = st.radio("상승률 기준 선택", ["CPI 원지수", "MoM (%)", "YoY (%)"], horizontal=True, key="path_view_mode")
+
+    current_sim_data = st.session_state[session_df_key]
+    hist_short = df_hist[-24:]
+    core_hist_series = get_core_history_series(df_hist)
+    core_hist_short = core_hist_series.loc[hist_short.index]
+    hist_mom_short = hist_mom_all[total_col].loc[hist_short.index]
+    hist_yoy_short = (df_hist[total_col].pct_change(12) * 100).loc[hist_short.index]
+    core_mom_short = core_hist_series.pct_change() * 100
+    core_yoy_short = core_hist_series.pct_change(12) * 100
+
+    fig_path = go.Figure()
+    if path_series_mode == "근원":
+        if "원지수" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_hist_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_hist_short.iloc[-1]] + list(current_sim_data["예상 core 원지수"])
+            y_lbl = "근원 원지수"
+        elif "MoM" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_mom_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_mom_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core MoM (%)"])
+            y_lbl = "근원 MoM 상승률 (%)"
+        else:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_yoy_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [core_yoy_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core YoY (%)"])
+            y_lbl = "근원 YoY 상승률 (%)"
+    else:
+        if "원지수" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short[total_col], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_short[total_col].iloc[-1]] + list(current_sim_data["예상 원지수"])
+            y_lbl = "CPI 원지수"
+        elif "MoM" in path_view_mode:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_mom_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_mom_short.iloc[-1]] + list(current_sim_data["예상 MoM (%)"])
+            y_lbl = "MoM 상승률 (%)"
+        else:
+            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_yoy_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
+            pred_y_arr = [hist_yoy_short.iloc[-1]] + list(current_sim_data["예상 YoY (%)"])
+            y_lbl = "YoY 상승률 (%)"
+
+    fig_path.add_trace(go.Scatter(
+        x=extended_dates, y=pred_y_arr, name=f'추정 경로 ({current_model})', mode='lines+markers',
+        line=dict(color='#d62728' if "평균" in current_model else '#1f77b4', width=3, dash='dash')
+    ))
+    fig_path.update_layout(xaxis_title="Date", yaxis_title=y_lbl, hovermode="x unified", height=520, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01))
+    st.plotly_chart(fig_path, use_container_width=True)
+
+    st.markdown("---")
     st.subheader("📅 연간 물가 상승률 추이")
     st.caption(
         f"엑셀 과거 데이터의 시작 연도부터 예측 기준월({target_date.strftime('%Y-%m')}) 이후까지 연간 지수를 산출합니다. "
@@ -2006,52 +2055,3 @@ with tab3:
         st.plotly_chart(fig_annual, use_container_width=True)
     else:
         st.info("연간 집계를 계산할 데이터가 부족합니다.")
-
-    st.markdown("---")
-    st.subheader(f"📉 {current_model} 기반 물가 경로")
-    path_series_mode = st.radio("데이터 종류 선택", ["총지수", "근원"], horizontal=True, key="path_series_mode")
-    path_view_mode = st.radio("상승률 기준 선택", ["CPI 원지수", "MoM (%)", "YoY (%)"], horizontal=True, key="path_view_mode")
-
-    current_sim_data = st.session_state[session_df_key]
-    hist_short = df_hist[-24:]
-    core_hist_series = get_core_history_series(df_hist)
-    core_hist_short = core_hist_series.loc[hist_short.index]
-    hist_mom_short = hist_mom_all[total_col].loc[hist_short.index]
-    hist_yoy_short = (df_hist[total_col].pct_change(12) * 100).loc[hist_short.index]
-    core_mom_short = core_hist_series.pct_change() * 100
-    core_yoy_short = core_hist_series.pct_change(12) * 100
-
-    fig_path = go.Figure()
-    if path_series_mode == "근원":
-        if "원지수" in path_view_mode:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_hist_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [core_hist_short.iloc[-1]] + list(current_sim_data["예상 core 원지수"])
-            y_lbl = "근원 원지수"
-        elif "MoM" in path_view_mode:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_mom_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [core_mom_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core MoM (%)"])
-            y_lbl = "근원 MoM 상승률 (%)"
-        else:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=core_yoy_short.loc[hist_short.index], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [core_yoy_short.loc[hist_short.index].iloc[-1]] + list(current_sim_data["예상 core YoY (%)"])
-            y_lbl = "근원 YoY 상승률 (%)"
-    else:
-        if "원지수" in path_view_mode:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_short[total_col], name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [hist_short[total_col].iloc[-1]] + list(current_sim_data["예상 원지수"])
-            y_lbl = "CPI 원지수"
-        elif "MoM" in path_view_mode:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_mom_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [hist_mom_short.iloc[-1]] + list(current_sim_data["예상 MoM (%)"])
-            y_lbl = "MoM 상승률 (%)"
-        else:
-            fig_path.add_trace(go.Scatter(x=hist_short.index, y=hist_yoy_short, name='과거 확정치', mode='lines+markers', line=dict(color='#7f7f7f', width=2.5)))
-            pred_y_arr = [hist_yoy_short.iloc[-1]] + list(current_sim_data["예상 YoY (%)"])
-            y_lbl = "YoY 상승률 (%)"
-
-    fig_path.add_trace(go.Scatter(
-        x=extended_dates, y=pred_y_arr, name=f'추정 경로 ({current_model})', mode='lines+markers',
-        line=dict(color='#d62728' if "평균" in current_model else '#1f77b4', width=3, dash='dash')
-    ))
-    fig_path.update_layout(xaxis_title="Date", yaxis_title=y_lbl, hovermode="x unified", height=520, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.01))
-    st.plotly_chart(fig_path, use_container_width=True)
