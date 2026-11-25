@@ -562,6 +562,64 @@ except Exception as _e:               # 모듈이 없어도 앱은 정상 동작
     LIVE_MODULES_OK, LIVE_IMPORT_ERR = False, str(_e)
 
 
+# ------------------------------------------
+# 배포본 신선도 점검
+#
+# 2026-11 에 실제로 있었던 사고: 배포된 opinet_daily_price 가 구버전이라
+# get_price_mom(target_ym=...) 을 받지 못해 호출마다 TypeError 로 떨어졌고,
+# 앱은 조용히 스냅샷 폴백만 썼다. 네트워크 진단은 HTTP 200 으로 '정상'이라
+# 보고해 원인 추적을 오히려 늦췄다.
+#
+# 그래서 네트워크가 아니라 '배포본이 앱이 기대하는 버전인가'를 본다.
+# 모듈 공개 API 를 바꿀 때 해당 모듈의 VERSION 과 아래 값을 함께 올린다.
+# ------------------------------------------
+MODULE_VERSION_STAMP = "2026-11-25"
+REQUIRED_MODULE_VERSIONS = {
+    "net_utils": MODULE_VERSION_STAMP,
+    "opinet_daily_price": MODULE_VERSION_STAMP,
+    "kamis_retail_price": MODULE_VERSION_STAMP,
+    "ekape_livestock_price": MODULE_VERSION_STAMP,
+}
+
+
+def check_module_versions():
+    """
+    수집 모듈의 VERSION 을 기대값과 대조한다.
+    반환: (구버전 목록 [(모듈, 배포본, 필요)], 표시용 행 목록)
+    """
+    import importlib
+
+    stale, rows = [], []
+    for name, wanted in REQUIRED_MODULE_VERSIONS.items():
+        try:
+            have = getattr(importlib.import_module(name), "VERSION", None)
+        except Exception as exc:
+            have, note = None, f"로드 실패: {exc}"
+        else:
+            note = ""
+
+        if have is None and not note:
+            note = "VERSION 없음 — 구버전"
+        # 날짜 문자열이라 사전식 비교로 신구 판정이 된다
+        outdated = note != "" or str(have) < wanted
+        if outdated:
+            stale.append((name, have or note or "없음", wanted))
+        rows.append({"모듈": name, "배포본": have or "-",
+                     "필요": wanted, "상태": "구버전" if outdated else "최신",
+                     "비고": note})
+    return stale, rows
+
+
+# 구버전이면 탭을 열지 않아도 보이도록 사이드바에 상시 표시한다.
+# 이 경고가 떠 있는 동안 실시간 수집은 믿을 수 없다.
+if LIVE_MODULES_OK:
+    _stale_modules, _ = check_module_versions()
+    if _stale_modules:
+        st.sidebar.error(
+            "⚠️ 배포본 구버전 — 재배포 필요\n\n"
+            + "\n".join(f"- {m}: {h} → {w}" for m, h, w in _stale_modules))
+
+
 def _clamp(x, lo, hi):
     return float(min(max(x, lo), hi))
 
@@ -1106,21 +1164,22 @@ with tab2:
         for _note in live.get("notes", []):
             st.caption(f"🔐 접속 경로 — {_note}")
 
-        with st.expander("🔧 연결 진단 (수집이 실패할 때 원인 확인)"):
-            if LIVE_MODULES_OK:
-                import net_utils
-                import ssl as _ssl
-                st.caption(f"net_utils {getattr(net_utils, 'VERSION', '구버전 — 재배포 필요')} · "
-                           f"{_ssl.OPENSSL_VERSION}")
-            st.caption("raw 소켓(TLS...)과 실제 통신 경로(requests...)를 같은 조건으로 "
-                       "비교합니다. `ResilientSession` 행이 HTTP 200이면 수집이 정상 "
-                       "동작하는 상태입니다.")
-            if st.button("진단 실행", key="run_diag"):
-                if LIVE_MODULES_OK:
-                    st.dataframe(pd.DataFrame(net_utils.diagnose_all()),
-                                 use_container_width=True, hide_index=True)
-                else:
-                    st.error(f"수집 모듈을 불러올 수 없습니다: {LIVE_IMPORT_ERR}")
+        with st.expander("🔧 배포본 점검 (수집이 실패할 때 먼저 확인)"):
+            stale, rows = check_module_versions()
+            if not LIVE_MODULES_OK:
+                st.error(f"수집 모듈을 불러올 수 없습니다: {LIVE_IMPORT_ERR}")
+            elif stale:
+                st.error(
+                    "⚠️ 배포본이 구버전입니다 — 아래 모듈을 다시 올리세요. "
+                    "이 상태에서는 앱이 모듈에 없는 인자를 넘겨 수집이 통째로 실패하고, "
+                    "실제 원인은 화면에 드러나지 않습니다.\n\n"
+                    + "\n".join(f"- `{m}` : 배포본 {h} / 필요 {w}" for m, h, w in stale))
+            else:
+                st.success(f"모듈 {len(rows)}개 모두 최신 ({MODULE_VERSION_STAMP})")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("수집 실패의 가장 흔한 원인은 네트워크가 아니라 배포 불일치입니다. "
+                       "모듈이 모두 최신인데도 출처가 `스냅샷`이면 그때는 접속 차단 "
+                       "문제이므로, DEPLOY.md 의 국내 호스팅 안내를 따르세요.")
 
         st.markdown("")
 

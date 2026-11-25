@@ -35,6 +35,10 @@ sys.path.insert(0, BASE_DIR)
 
 from net_utils import SessionPool, make_session, pmap
 
+# 배포본이 최신인지 앱에서 바로 확인하기 위한 표식.
+# 공개 API(get_price_mom 등)를 바꿀 때마다 올린다.
+VERSION = "2026-11-25"
+
 try:
     import ekape_livestock_price as ekape
 except ImportError:      # 축산물 모듈이 없으면 농·수산물만 수집

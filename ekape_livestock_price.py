@@ -33,6 +33,9 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from net_utils import SessionPool, make_session, pmap
 
+# 배포본이 최신인지 앱에서 바로 확인하기 위한 표식.
+VERSION = "2026-11-25"
+
 BASE = "https://www.ekapepia.com"
 PRICE_URL = f"{BASE}/v3/price/consumer/periodPrice.do"
 SPEC_URL = f"{BASE}/supPrice/getRtsalSelectCode.json"

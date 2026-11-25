@@ -30,6 +30,10 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from net_utils import make_session, pmap
 
+# 배포본이 최신인지 앱에서 바로 확인하기 위한 표식.
+# 공개 API(get_price_mom 등)를 바꿀 때마다 올린다.
+VERSION = "2026-11-25"
+
 BASE = "https://www.opinet.co.kr"
 
 # (조회 페이지 URL, CSV 엔드포인트 URL)

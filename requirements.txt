@@ -1,3 +1,8 @@
+# 버전을 고정하지 않는다.
+# Streamlit Cloud 앱의 Python 버전에 맞는 조합을 pip 가 고르게 둔다.
+# 2026-11 에 numpy==2.3.2(Python>=3.11 요구) 등으로 고정했다가 설치 단계에서
+# 떨어져 앱이 아예 기동하지 않았다. 고정하려면 Cloud 의 Python 버전을 먼저
+# 확인하고 그에 맞는 상한·하한으로 잡는다.
 streamlit
 pandas
 numpy
@@ -5,4 +10,5 @@ plotly
 statsmodels
 openpyxl
 requests
+# pandas.read_html 백엔드 — 없으면 KAMIS/EKAPE 파싱이 런타임에 실패한다
 lxml
