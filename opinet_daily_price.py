@@ -17,17 +17,18 @@
 산출 : 월평균(일별 또는 주별 단순평균) 및 직전월 대비 당월 MoM 변동률
 """
 
+import calendar
 import io
 import os
 import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from net_utils import make_session
+from net_utils import make_session, pmap
 
 BASE = "https://www.opinet.co.kr"
 
@@ -75,12 +76,30 @@ def _session(page_url: str) -> requests.Session:
     return make_session(referer=page_url, warm_url=page_url)
 
 
+def _parse_hidden(html: str) -> dict:
+    return dict(re.findall(r'name="(h_max\w+)"[^>]*value="([^"]*)"', html))
+
+
 def _hidden_fields(session: requests.Session, page_url: str) -> dict:
     """조회 페이지의 h_max* hidden 필드를 그대로 긁어온다 (서버 검증용)."""
     res = session.get(page_url, timeout=20)
     res.raise_for_status()
     res.encoding = "euc-kr"
-    return dict(re.findall(r'name="(h_max\w+)"[^>]*value="([^"]*)"', res.text))
+    return _parse_hidden(res.text)
+
+
+def _open_page(page_url: str) -> tuple:
+    """
+    조회 페이지를 딱 한 번만 GET 해서 세션 쿠키와 h_max* hidden 필드를 함께 얻는다.
+    (세션 워밍업과 hidden 필드 조회가 같은 페이지라 나눠 부를 이유가 없다.)
+
+    반환: (Session, hidden 필드 dict)
+    """
+    s = make_session(referer=page_url)          # 워밍업은 아래 GET이 대신한다
+    res = s.get(page_url, timeout=20)
+    res.raise_for_status()
+    res.encoding = "euc-kr"
+    return s, _parse_hidden(res.text)
 
 
 def _post_csv(session: requests.Session, csv_url: str, payload: dict) -> pd.DataFrame:
@@ -142,23 +161,65 @@ def _to_indexed(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 # 1. 최신 갱신일 조회
 # ----------------------------------------------------------------------
-def get_latest_date(session: requests.Session = None) -> date:
-    """주유소 제품별 페이지의 h_maxDD(=일간 최신 데이터 일자)를 읽어온다."""
-    page_url, _ = SRC_OIL
-    session = session or _session(page_url)
-    s = _hidden_fields(session, page_url).get("h_maxDD")
+def _latest_from_hidden(hidden: dict) -> date:
+    """h_maxDD(=일간 최신 데이터 일자) 문자열을 date로 변환."""
+    s = hidden.get("h_maxDD")
     if not s:
         raise RuntimeError("오피넷 페이지에서 최신 갱신일(h_maxDD)을 찾지 못했습니다.")
     return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
 
 
+def get_latest_date(session: requests.Session = None) -> date:
+    """주유소 제품별 페이지의 h_maxDD(=일간 최신 데이터 일자)를 읽어온다."""
+    page_url, _ = SRC_OIL
+    session = session or _session(page_url)
+    return _latest_from_hidden(_hidden_fields(session, page_url))
+
+
+# ----------------------------------------------------------------------
+# 1-b. 기준월 지정 유틸
+# ----------------------------------------------------------------------
+def parse_target_ym(target_ym) -> tuple:
+    """
+    기준월 입력을 (연, 월) 튜플로 정규화.
+      '2026-07' / '2026-07-15' / '202607' / (2026, 7) / date / datetime
+      / pandas.Timestamp (strftime 지원 객체) 모두 허용.
+    """
+    if isinstance(target_ym, (tuple, list)) and len(target_ym) == 2:
+        return int(target_ym[0]), int(target_ym[1])
+
+    if isinstance(target_ym, (date, datetime)):
+        return target_ym.year, target_ym.month
+
+    # pandas.Timestamp 등 year/month 속성을 가진 객체
+    if hasattr(target_ym, "year") and hasattr(target_ym, "month"):
+        return int(target_ym.year), int(target_ym.month)
+
+    s = str(target_ym).strip()
+    m = re.match(r"^(\d{4})[-/.]?(\d{1,2})", s)
+    if not m:
+        raise ValueError(f"기준월을 해석할 수 없습니다: {target_ym!r} (예: '2026-07')")
+
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not 1 <= mo <= 12:
+        raise ValueError(f"기준월의 월 값이 잘못되었습니다: {target_ym!r}")
+    return y, mo
+
+
+def _month_end(y: int, m: int) -> date:
+    return date(y, m, calendar.monthrange(y, m)[1])
+
+
 # ----------------------------------------------------------------------
 # 2-a. 주유소 제품별 일별 가격 (휘발유 / 경유 / 등유)
 # ----------------------------------------------------------------------
-def fetch_oil_daily(start: date, end: date) -> pd.DataFrame:
-    """보통휘발유·자동차용경유·실내등유의 일별 전국 평균 판매가격."""
+def fetch_oil_daily(start: date, end: date, page=None) -> pd.DataFrame:
+    """
+    보통휘발유·자동차용경유·실내등유의 일별 전국 평균 판매가격.
+    page : _open_page()가 돌려준 (Session, hidden필드). 주면 페이지를 다시 열지 않는다.
+    """
     page_url, csv_url = SRC_OIL
-    s = _session(page_url)
+    s, hidden = page or _open_page(page_url)
 
     payload = {
         "all_chk_cnt": "5",
@@ -171,7 +232,7 @@ def fetch_oil_daily(start: date, end: date) -> pd.DataFrame:
         "END_Y": f"{end.year}",   "END_M": f"{end.month:02d}",   "END_D": f"{end.day:02d}",
         "equal": "Y",
     }
-    payload.update(_hidden_fields(s, page_url))
+    payload.update(hidden)
     for code in OIL_PRODUCTS:
         payload[f"OIL_CD_{code}"] = "Y"
 
@@ -181,10 +242,10 @@ def fetch_oil_daily(start: date, end: date) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 # 2-b. 차량용 부탄 일별 가격 (자동차부탄)
 # ----------------------------------------------------------------------
-def fetch_butane_daily(start: date, end: date) -> pd.DataFrame:
+def fetch_butane_daily(start: date, end: date, page=None) -> pd.DataFrame:
     """자동차부탄(K015)의 일별 전국 평균 판매가격."""
     page_url, csv_url = SRC_BUTANE
-    s = _session(page_url)
+    s, hidden = page or _open_page(page_url)
 
     payload = {
         "TERM": "D",
@@ -196,7 +257,7 @@ def fetch_butane_daily(start: date, end: date) -> pd.DataFrame:
         "OIL_CD_K021_P": "",
         "OIL_CD_K022_P": "",
     }
-    payload.update(_hidden_fields(s, page_url))
+    payload.update(hidden)
 
     return _to_indexed(_post_csv(s, csv_url, payload))
 
@@ -205,14 +266,14 @@ def fetch_butane_daily(start: date, end: date) -> pd.DataFrame:
 # 2-c. 충전소 LPG 주간 가격 (일반프로판 / 일반부탄)
 #      ※ 이 페이지는 일간 데이터가 없고 주간(W)이 최소 단위
 # ----------------------------------------------------------------------
-def fetch_lpg_weekly(start: date, end: date) -> pd.DataFrame:
+def fetch_lpg_weekly(start: date, end: date, page=None) -> pd.DataFrame:
     """
     일반프로판(K021)·일반부탄(K022)의 주간 전국 평균 판매가격.
     start/end는 날짜를 받지만 실제로는 '해당 월 전체 주차'를 요청한다
     (시작월 1주 ~ 종료월 5주, 존재하지 않는 주차는 서버가 알아서 잘라냄).
     """
     page_url, csv_url = SRC_LPG
-    s = _session(page_url)
+    s, hidden = page or _open_page(page_url)
 
     payload = {
         "TERM": "W",  # 일간 없음 -> 주간이 최소 단위
@@ -221,7 +282,7 @@ def fetch_lpg_weekly(start: date, end: date) -> pd.DataFrame:
         "OIL_CD_K021_P": "Y",   # 일반프로판
         "OIL_CD_K022_P": "Y",   # 일반부탄
     }
-    payload.update(_hidden_fields(s, page_url))
+    payload.update(hidden)
 
     return _to_indexed(_post_csv(s, csv_url, payload))
 
@@ -295,9 +356,14 @@ def _order_items(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 # 4. 메인 진입점
 # ----------------------------------------------------------------------
-def get_price_mom(base_date: date = None, verbose: bool = True):
+def get_price_mom(base_date: date = None, target_ym=None, verbose: bool = True):
     """
-    base_date를 주지 않으면 오피넷 최신 갱신일을 자동으로 사용한다.
+    target_ym : 기준월('2026-07', date, pandas.Timestamp 등). 지정하면 그 달을
+                당월로 삼아 '직전월 대비 기준월' MoM을 산출한다. 기준월이 이미
+                지난 달이면 월말까지의 전체 평균, 진행 중인 달이면 오피넷 최신
+                갱신일까지의 부분 평균(속보치)을 쓴다.
+    base_date : 수집 종료일을 직접 지정 (target_ym과 동시 사용 불가).
+    둘 다 주지 않으면 오피넷 최신 갱신일을 자동으로 사용한다.
 
     반환: dict
       'daily_oil'    - 휘발유/경유/등유 일별
@@ -307,8 +373,31 @@ def get_price_mom(base_date: date = None, verbose: bool = True):
       'mom'          - 직전월 대비 당월 MoM 테이블
       'weighted'     - 가중치·기여도 테이블
       'group_mom'    - 가중합산 석유류 그룹 MoM(%)
+      'target_ym'    - 당월(기준월) 'YYYY-MM'
+      'prev_ym'      - 직전월 'YYYY-MM'
+      'base_date'    - 실제 수집 종료일
+      'latest_date'  - 오피넷 최신 갱신일
+      'is_partial'   - 기준월이 아직 진행 중이라 부분 평균인지 여부
     """
-    latest = base_date or get_latest_date()
+    if base_date is not None and target_ym is not None:
+        raise ValueError("base_date와 target_ym은 함께 사용할 수 없습니다.")
+
+    # 주유소 페이지는 한 번만 열어 최신 갱신일과 hidden 필드를 함께 얻고,
+    # 그 세션을 아래 CSV 조회에 그대로 재사용한다.
+    oil_page = _open_page(SRC_OIL[0])
+    latest_avail = _latest_from_hidden(oil_page[1])
+
+    if target_ym is not None:
+        y, m = parse_target_ym(target_ym)
+        month_end = _month_end(y, m)
+        if date(y, m, 1) > latest_avail:
+            raise RuntimeError(
+                f"기준월 {y}-{m:02d} 데이터가 아직 없습니다 "
+                f"(오피넷 최신 갱신일 {latest_avail:%Y-%m-%d})."
+            )
+        latest = min(month_end, latest_avail)
+    else:
+        latest = base_date or latest_avail
 
     curr_start = latest.replace(day=1)
     prev_end = curr_start - timedelta(days=1)
@@ -316,16 +405,31 @@ def get_price_mom(base_date: date = None, verbose: bool = True):
 
     prev_ym = f"{prev_start:%Y-%m}"
     curr_ym = f"{curr_start:%Y-%m}"
+    is_partial = latest < _month_end(latest.year, latest.month)
 
     if verbose:
-        print(f"📅 오피넷 최신 갱신일 : {latest:%Y-%m-%d}")
+        print(f"📅 기준월(당월)      : {curr_ym}"
+              f"{' (진행 중 · 속보치)' if is_partial else ' (마감)'}")
+        print(f"   오피넷 최신 갱신일 : {latest_avail:%Y-%m-%d}")
         print(f"   직전월 구간       : {prev_start:%Y-%m-%d} ~ {prev_end:%Y-%m-%d}")
         print(f"   당월 구간         : {curr_start:%Y-%m-%d} ~ {latest:%Y-%m-%d}")
         print()
 
-    daily_oil = fetch_oil_daily(prev_start, latest)
-    daily_butane = fetch_butane_daily(prev_start, latest)
-    weekly_lpg = fetch_lpg_weekly(prev_start, latest)
+    # 세 소스는 서로 독립이라 병렬로 받는다 (각 스레드가 자기 세션을 쓴다).
+    fetchers = [
+        ("daily_oil", lambda: fetch_oil_daily(prev_start, latest, oil_page)),
+        ("daily_butane", lambda: fetch_butane_daily(prev_start, latest)),
+        ("weekly_lpg", lambda: fetch_lpg_weekly(prev_start, latest)),
+    ]
+    fetched = {}
+    for (name, _), df, err in pmap(lambda t: t[1](), fetchers, max_workers=3):
+        if err is not None:
+            raise err          # 한 품목이라도 빠지면 가중합산이 성립하지 않는다
+        fetched[name] = df
+
+    daily_oil = fetched["daily_oil"]
+    daily_butane = fetched["daily_butane"]
+    weekly_lpg = fetched["weekly_lpg"]
 
     monthly = _order_items(pd.concat(
         [monthly_average(daily_oil),
@@ -371,7 +475,10 @@ def get_price_mom(base_date: date = None, verbose: bool = True):
             "MoM(%)": "{:>+7.2f}%".format,
         }))
         print("-" * 84)
-        print(f"※ {curr_ym}은 {latest:%m월 %d일}까지의 부분 평균 기준(속보치)입니다.")
+        if is_partial:
+            print(f"※ {curr_ym}은 {latest:%m월 %d일}까지의 부분 평균 기준(속보치)입니다.")
+        else:
+            print(f"※ {curr_ym}은 월말({latest:%m월 %d일})까지의 전체 평균 기준입니다.")
         print("※ 일반프로판·일반부탄은 주간 고시가라 월중 변동이 없어 주간평균 = 오피넷 월간값입니다.")
         print("=" * 84)
 
@@ -398,6 +505,11 @@ def get_price_mom(base_date: date = None, verbose: bool = True):
         "mom": mom,
         "weighted": weighted,
         "group_mom": group_mom,
+        "target_ym": curr_ym,
+        "prev_ym": prev_ym,
+        "base_date": latest,
+        "latest_date": latest_avail,
+        "is_partial": is_partial,
     }
 
 
@@ -407,7 +519,9 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    result = get_price_mom()
+    # 사용법: python opinet_daily_price.py [기준월]   (예: python opinet_daily_price.py 2026-07)
+    cli_ym = sys.argv[1] if len(sys.argv) > 1 else None
+    result = get_price_mom(target_ym=cli_ym)
 
     # 필요 시 저장
     # result["monthly"].to_csv("opinet_monthly.csv", encoding="utf-8-sig")

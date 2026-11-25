@@ -24,7 +24,6 @@
 import os
 import re
 import sys
-import time
 from datetime import date
 from io import StringIO
 
@@ -32,7 +31,7 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from net_utils import make_session
+from net_utils import SessionPool, make_session, pmap
 
 BASE = "https://www.ekapepia.com"
 PRICE_URL = f"{BASE}/v3/price/consumer/periodPrice.do"
@@ -56,7 +55,9 @@ LIVESTOCK_TYPES = {
 
 KEY_COLS = ["축종", "부위/규격", "단위", "등급"]
 
-REQUEST_DELAY = 0.3  # 서버 부담을 줄이기 위한 요청 간 간격(초)
+# 축종 × 부위/규격이 20건 안팎이라 순차로 돌면 대부분의 시간이 응답 대기다.
+# 동시 요청 수 — 서버에 과한 부담을 주지 않으면서 대기를 겹치는 선.
+MAX_WORKERS = 6
 
 
 # ----------------------------------------------------------------------
@@ -167,37 +168,57 @@ def fetch_month_price(type_code: str, spec_code: str, start_ym: str, end_ym: str
 
 
 def fetch_all(start_ym: str, end_ym: str, session: requests.Session = None,
-              verbose: bool = True, all_specs: bool = False) -> pd.DataFrame:
+              verbose: bool = True, all_specs: bool = False,
+              max_workers: int = MAX_WORKERS) -> pd.DataFrame:
     """
     축종별 월별 가격을 수집한다.
     all_specs=False(기본)이면 축종마다 부위/규격 목록의 첫 항목(=화면 기본 선택)만 받는다.
+
+    부위/규격 목록 조회와 가격 조회를 각각 병렬로 돌린다. 결과 순서는 순차
+    수집과 동일하게 LIVESTOCK_TYPES 순서를 유지한다.
     """
-    session = session or _session()
+    pool = SessionPool(_session)
+    pool.preset(session)          # 호출부가 준 세션은 현재 스레드에서 그대로 쓴다
+
+    # ---- 1단계: 축종별 부위/규격 목록 (7건) ----
+    def _specs(type_code):
+        found = get_spec_list(type_code, pool.session)
+        return found if all_specs else found[:1]
+
+    targets = []
+    for type_code, specs, err in pmap(_specs, list(LIVESTOCK_TYPES), max_workers):
+        type_name = LIVESTOCK_TYPES[type_code]
+        if err is not None:
+            print(f"      ⚠️ {type_name} 부위/규격 목록 조회 실패 — 건너뜁니다: {err}")
+            continue
+        if verbose:
+            print(f"   [{type_name}] {', '.join(n for _, n in specs)} 조회 중...")
+        targets += [(type_code, type_name, code, name) for code, name in specs]
+
+    # ---- 2단계: (축종 × 부위/규격)별 월간 가격 ----
+    def _price(target):
+        type_code, _, spec_code, _ = target
+        return fetch_month_price(type_code, spec_code, start_ym, end_ym, pool.session)
 
     rows = []
-    for type_code, type_name in LIVESTOCK_TYPES.items():
-        specs = get_spec_list(type_code, session)
-        if not all_specs:
-            specs = specs[:1]
-        if verbose:
-            names = ", ".join(n for _, n in specs)
-            print(f"   [{type_name}] {names} 조회 중...")
+    for target, r, err in pmap(_price, targets, max_workers):
+        _, type_name, _, spec_name = target
 
-        for spec_code, spec_name in specs:
-            r = fetch_month_price(type_code, spec_code, start_ym, end_ym, session)
-            if not r["prices"]:
-                print(f"      ⚠️ {type_name} - {spec_name} 데이터 없음")
-                continue
+        if err is not None:
+            print(f"      ⚠️ {type_name} - {spec_name} 조회 실패 — 건너뜁니다: {err}")
+            continue
+        if not r["prices"]:
+            print(f"      ⚠️ {type_name} - {spec_name} 데이터 없음")
+            continue
 
-            rows.append({
-                "축종": type_name,
-                "부위/규격": spec_name,
-                "단위": r["unit"],
-                "등급": r["grade"] or "-",
-                "전년동월": r["last_year"],   # 기준은 조회 종료월(end_ym)
-                **r["prices"],
-            })
-            time.sleep(REQUEST_DELAY)
+        rows.append({
+            "축종": type_name,
+            "부위/규격": spec_name,
+            "단위": r["unit"],
+            "등급": r["grade"] or "-",
+            "전년동월": r["last_year"],   # 기준은 조회 종료월(end_ym)
+            **r["prices"],
+        })
 
     if not rows:
         raise RuntimeError("축산물 가격을 한 건도 수집하지 못했습니다.")

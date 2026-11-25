@@ -19,7 +19,9 @@ SSLError가 나면 완화된 TLS 설정으로 어댑터를 갈아끼운 뒤 한 
 """
 
 import ssl
+import threading
 import urllib3
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import requests
@@ -55,7 +57,11 @@ BROWSER_HEADERS = {
 }
 
 # 배포된 파일이 최신인지 앱에서 바로 확인하기 위한 표식
-VERSION = "2026-07-30.2"
+VERSION = "2026-08-04.1"
+
+# 수집을 병렬로 돌리면 같은 호스트로 동시에 여러 연결이 나간다.
+# 기본 풀(10)로는 모자라 연결이 버려지고 재수립되므로 넉넉히 잡는다.
+POOL_SIZE = 24
 
 # OpenSSL 3.x에만 있는 옵션이라 없는 환경에서는 0으로 떨어뜨린다
 _OP_LEGACY_SERVER_CONNECT = getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
@@ -135,7 +141,9 @@ class ResilientSession(requests.Session):
                             status_forcelist=[429, 500, 502, 503, 504],
                             allowed_methods=["GET", "POST"])
         for prefix in ("http://", "https://"):
-            self.mount(prefix, HTTPAdapter(max_retries=self._retry))
+            self.mount(prefix, HTTPAdapter(max_retries=self._retry,
+                                           pool_connections=POOL_SIZE,
+                                           pool_maxsize=POOL_SIZE))
 
         # 실패를 겪은 뒤에 어댑터를 갈아끼우는 방식은 세션 워밍업·리다이렉트·
         # 커넥션 풀 재사용이 얽히면 타이밍이 어긋날 수 있다. SECLEVEL=1은
@@ -150,7 +158,9 @@ class ResilientSession(requests.Session):
         """지정한 암호군/검증설정으로 HTTPS 어댑터를 갈아끼운다."""
         self.mount("https://", LegacyTLSAdapter(insecure=insecure,
                                                 ciphers=ciphers,
-                                                max_retries=self._retry))
+                                                max_retries=self._retry,
+                                                pool_connections=POOL_SIZE,
+                                                pool_maxsize=POOL_SIZE))
         self._ciphers = ciphers
         self._insecure_on = insecure
 
@@ -242,6 +252,65 @@ def make_session(referer: str = None, warm_url: str = None,
             pass      # 워밍업 실패는 치명적이지 않다. 본 요청에서 다시 판단한다.
 
     return s
+
+
+# ----------------------------------------------------------------------
+# 병렬 수집 유틸
+#
+# 수집 시간의 대부분은 국내 공공 사이트의 응답 대기(I/O)라 스레드로 겹쳐
+# 돌리면 벽시계 시간이 크게 줄어든다. 다만 requests.Session은 스레드 안전이
+# 보장되지 않고, ResilientSession은 SSL 실패 시 어댑터를 갈아끼우기까지 하므로
+# 세션을 스레드끼리 공유하면 안 된다. SessionPool이 스레드별로 하나씩 만들어 준다.
+# ----------------------------------------------------------------------
+class SessionPool:
+    """스레드마다 세션을 하나씩 만들어 재사용한다 (워밍업 GET도 스레드당 1회)."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._local = threading.local()
+
+    def preset(self, session):
+        """이미 만들어 둔 세션을 현재 스레드 몫으로 등록한다."""
+        if session is not None:
+            self._local.session = session
+
+    @property
+    def session(self):
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = self._local.session = self._factory()
+        return s
+
+
+def pmap(fn, items, max_workers: int = 8) -> list:
+    """
+    items를 스레드로 병렬 처리하고 입력 순서 그대로 [(item, 결과, 예외)] 반환.
+
+    예외를 밖으로 던지지 않는 이유: 품목 하나가 실패해도 나머지는 살려야 한다.
+    호출부에서 error가 None인 것만 골라 쓰면 된다.
+    """
+    items = list(items)
+    if not items:
+        return []
+
+    if len(items) == 1 or max_workers <= 1:      # 스레드를 띄울 이유가 없다
+        out = []
+        for it in items:
+            try:
+                out.append((it, fn(it), None))
+            except Exception as e:
+                out.append((it, None, e))
+        return out
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as ex:
+        futures = [ex.submit(fn, it) for it in items]
+        out = []
+        for it, fut in zip(items, futures):
+            try:
+                out.append((it, fut.result(), None))
+            except Exception as e:
+                out.append((it, None, e))
+    return out
 
 
 # ----------------------------------------------------------------------

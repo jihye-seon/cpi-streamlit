@@ -21,6 +21,7 @@
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from io import StringIO
 
@@ -29,8 +30,11 @@ import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 다른 디렉터리에서 실행해도 옆에 있는 축산물 모듈을 찾도록 경로 보정
+# 다른 디렉터리에서 실행해도 옆에 있는 모듈을 찾도록 경로 보정
 sys.path.insert(0, BASE_DIR)
+
+from net_utils import SessionPool, make_session, pmap
+
 try:
     import ekape_livestock_price as ekape
 except ImportError:      # 축산물 모듈이 없으면 농·수산물만 수집
@@ -88,10 +92,7 @@ _EMPTY_HINT = re.compile(r"조사일|데이터가 없습니다|검색조건")
 # ----------------------------------------------------------------------
 def _session() -> requests.Session:
     """조회 페이지를 먼저 열어 세션 쿠키를 확보한 Session 반환."""
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Referer": URL})
-    s.get(URL, timeout=25)
-    return s
+    return make_session(referer=URL, warm_url=URL)
 
 
 def _payload(action: str, **kw) -> dict:
@@ -190,12 +191,20 @@ def fetch_monthly(year: int, month: int, category: str = "",
 
 
 def fetch_monthly_all(year: int, month: int, session: requests.Session = None) -> pd.DataFrame:
-    """부류별로 나눠 조회한 뒤 '부류' 라벨을 붙여 하나로 합친다."""
-    session = session or _session()
+    """
+    부류별로 나눠 조회한 뒤 '부류' 라벨을 붙여 하나로 합친다.
+    부류 5건은 서로 독립이라 병렬로 받는다 (결과 순서는 CATEGORIES 순서를 유지).
+    """
+    pool = SessionPool(_session)
+    pool.preset(session)
 
     frames = []
-    for code, name in CATEGORIES.items():
-        df = fetch_monthly(year, month, code, session)
+    for code, df, err in pmap(lambda c: fetch_monthly(year, month, c, pool.session),
+                              list(CATEGORIES), max_workers=len(CATEGORIES)):
+        name = CATEGORIES[code]
+        if err is not None:
+            print(f"   ⚠️ {name}({code}) 조회 실패 — 건너뜁니다: {err}")
+            continue
         if df.empty:
             print(f"   ⚠️ {name}({code}) 데이터 없음 — 건너뜁니다.")
             continue
@@ -487,7 +496,10 @@ def get_price_mom(year: int = None, month: int = None, verbose: bool = True,
                   weight_file: str = None, fill_seasonal: bool = True):
     """
     메인 진입점.
-    year/month를 주지 않으면 KAMIS 최신 조사월을 자동으로 사용한다.
+    year/month를 주면 그 달을 기준월로 삼아 '직전월 대비 기준월' MoM을 산출한다.
+    (기준월이 이미 마감된 달이면 월 전체 평균, 진행 중인 달이면 최신 조사일까지의
+     부분 평균이 KAMIS 월간 일람표에 담겨 온다.)
+    주지 않으면 KAMIS 최신 조사월을 자동으로 사용한다.
     include_livestock=True면 EKAPE 축산물을 같은 기준월로 받아 함께 붙인다.
     가중합산에서 축종별 전 부위를 평균내야 하므로 livestock_all_specs 기본값은 True.
 
@@ -499,33 +511,59 @@ def get_price_mom(year: int = None, month: int = None, verbose: bool = True,
       'group_mom'  - 농축수산물 가중합산 MoM(%)
       'coverage'   - 매칭 커버리지 요약
       'year', 'month', 'survey_date'
+      'latest_year', 'latest_month' - KAMIS 최신 조사월
+      'is_partial' - 기준월이 아직 진행 중이라 부분 평균인지 여부
     """
     session = _session()
 
-    if year is None or month is None:
-        year, month = get_latest_month(session)
+    # 최신 조사월과 최신 조사일은 서로 독립인 조회라 함께 던진다.
+    # (세션은 스레드끼리 공유하지 않는다 — 조사일 쪽은 자기 세션을 새로 만든다.)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_survey = ex.submit(get_latest_survey_date)
+        latest_y, latest_m = get_latest_month(session)
+        try:
+            survey_date = fut_survey.result()
+        except Exception:
+            survey_date = None      # 조사일은 표시용이라 없어도 산출은 진행한다
 
-    survey_date = get_latest_survey_date(session)
+    if year is None or month is None:
+        year, month = latest_y, latest_m
+    elif (year, month) > (latest_y, latest_m):
+        raise RuntimeError(
+            f"기준월 {year}-{month:02d} 데이터가 아직 없습니다 "
+            f"(KAMIS 최신 조사월 {latest_y}-{latest_m:02d})."
+        )
+
+    # 기준월이 아직 달력상 진행 중이면 부분 평균(속보치).
+    # KAMIS 최신 조사월과 비교하면 안 된다 — 8월 초에도 최신 조사월은 7월(마감)이다.
+    _today = date.today()
+    is_partial = (year, month) == (_today.year, _today.month)
 
     prev_y, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
     curr_lbl = f"{year}-{month:02d}"
     prev_lbl = f"{prev_y}-{prev_m:02d}"
 
     if verbose:
-        print(f"📅 KAMIS 최신 조사월 : {curr_lbl}"
+        print(f"📅 기준월(당월)      : {curr_lbl}"
+              f"{' (진행 중 · 속보치)' if is_partial else ' (마감)'}")
+        print(f"   KAMIS 최신 조사월 : {latest_y}-{latest_m:02d}"
               + (f" (최신 조사일 {survey_date})" if survey_date else ""))
         print(f"   비교 기준        : {curr_lbl} vs {prev_lbl}")
         print()
 
-    raw = fetch_monthly_all(year, month, session)
+    # KAMIS(농·수산물)와 EKAPE(축산물)는 아예 다른 사이트라 동시에 받는다.
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_live = (ex.submit(fetch_livestock_mom, year, month, verbose,
+                              livestock_all_specs)
+                    if include_livestock else None)
+
+        raw = fetch_monthly_all(year, month, session)
+        livestock = fut_live.result() if fut_live is not None else pd.DataFrame()
+
     mom = build_mom(raw, year, month)
 
-    livestock = pd.DataFrame()
-    if include_livestock:
-        print()
-        livestock = fetch_livestock_mom(year, month, verbose, livestock_all_specs)
-        if not livestock.empty:
-            mom = pd.concat([mom, livestock[mom.columns]], ignore_index=True)
+    if not livestock.empty:
+        mom = pd.concat([mom, livestock[mom.columns]], ignore_index=True)
 
     if verbose:
         n_ok = mom["MoM(%)"].notna().sum()
@@ -639,9 +677,12 @@ def get_price_mom(year: int = None, month: int = None, verbose: bool = True,
     if verbose:
         print()
         print("-" * 104)
-        print(f"※ {curr_lbl}은 "
-              + (f"KAMIS {survey_date}까지의 " if survey_date else "")
-              + "부분 평균 기준(속보치)입니다.")
+        if is_partial:
+            print(f"※ {curr_lbl}은 "
+                  + (f"KAMIS {survey_date}까지의 " if survey_date else "")
+                  + "부분 평균 기준(속보치)입니다.")
+        else:
+            print(f"※ {curr_lbl}은 마감된 달이라 월 전체 평균 기준입니다.")
         print("※ 농·수산물은 KAMIS 소매가격, 축산물은 EKAPE 소비자가격(전국 평균)에서 가져옵니다.")
         print("※ 두 출처는 조사 기관·방식이 달라 가격 수준을 직접 비교하지 마세요. MoM 비교용입니다.")
         print("=" * 104)
@@ -650,7 +691,9 @@ def get_price_mom(year: int = None, month: int = None, verbose: bool = True,
             "weighted": weighted, "group_mom": group_mom, "coverage": coverage,
             "group_mom_actual": group_mom_actual, "coverage_actual": coverage_actual,
             "seasonal_years": used_years,
-            "year": year, "month": month, "survey_date": survey_date}
+            "year": year, "month": month, "survey_date": survey_date,
+            "latest_year": latest_y, "latest_month": latest_m,
+            "is_partial": is_partial}
 
 
 if __name__ == "__main__":
@@ -659,7 +702,13 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    result = get_price_mom()
+    # 사용법: python kamis_retail_price.py [기준월]   (예: python kamis_retail_price.py 2026-07)
+    _y = _m = None
+    if len(sys.argv) > 1:
+        import opinet_daily_price as _op
+        _y, _m = _op.parse_target_ym(sys.argv[1])
+
+    result = get_price_mom(year=_y, month=_m)
 
     # 필요 시 저장
     # result["mom"].to_excel("KAMIS_소매가격_MoM.xlsx", index=False)

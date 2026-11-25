@@ -777,10 +777,77 @@ current_model = st.radio(
     key="model_choice"
 )
 
+
+# ==========================================
+# 🏠 [KB] 집세 — KB 주간 전세지수 기반 추천값 (옵션)
+#
+# 기본값은 SARIMA다. TAB 2의 토글을 켤 때만 집세 추천값이 KB 2단계 릿지
+# 모형으로 교체된다. 2024-01~2026-10 34개월 검증 MAE(지수포인트):
+#     SARIMA(3,1,0)(0,0,1,12)  0.02129
+#     KB 2단계 릿지             0.01822
+#
+# 토글 위젯은 TAB 2(아래 약 300줄)에서 렌더되지만 rec_values 가 여기서
+# 확정되므로, 상태는 세션에서 미리 읽는다. 클릭 시 st.rerun() 으로 반영된다.
+# (위젯이 렌더된 뒤 그 key의 session_state 를 바꾸면 Streamlit 이 예외를 던진다)
+# ==========================================
+try:
+    import rent_cpi_kb
+    KB_HOUSING_OK, KB_HOUSING_IMPORT_ERR = True, None
+except Exception as _e:          # 모듈이 없어도 앱은 정상 동작해야 한다
+    rent_cpi_kb = None
+    KB_HOUSING_OK, KB_HOUSING_IMPORT_ERR = False, str(_e)
+
+
+def _kb_csv_signature():
+    """kb_jeonse.csv 의 변경을 캐시 키로 잡기 위한 서명. 없으면 None."""
+    if not KB_HOUSING_OK:
+        return None
+    path = getattr(rent_cpi_kb, "KB_CSV", "")
+    if path and os.path.exists(path):
+        stat = os.stat(path)
+        return (stat.st_mtime_ns, stat.st_size)
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_kb_housing(rent_series, asof_date, csv_signature):
+    """KB 전세지수 기반 집세 MoM. 1회 약 4초이므로 캐시에 담아 둔다."""
+    return rent_cpi_kb.forecast(rent_series, asof=asof_date)
+
+
+KB_CSV_SIGNATURE = _kb_csv_signature()
+# 토글을 띄울 수 있는 상태인가 (모듈 + CSV 둘 다 있어야 한다)
+KB_HOUSING_AVAILABLE = bool(KB_HOUSING_OK and KB_CSV_SIGNATURE)
+
+kb_housing, kb_housing_err = None, None
+if KB_HOUSING_AVAILABLE and st.session_state.get("use_kb_housing", False):
+    try:
+        kb_housing = fetch_kb_housing(df_hist['집세'],
+                                      pd.Timestamp.today().normalize(),
+                                      KB_CSV_SIGNATURE)
+        if not kb_housing.get("usable", True):
+            kb_housing_err = (
+                f"KB 자료가 {kb_housing['kb_stale_weeks']:.0f}주 경과해 "
+                f"{rent_cpi_kb.STALE_DISABLE_WEEKS}주 임계를 넘었습니다. "
+                "이 상태에서는 KB 반영이 오차를 오히려 키우므로 SARIMA를 유지합니다.")
+            kb_housing = None
+    except Exception as _e:
+        kb_housing_err = str(_e)
+        kb_housing = None
+
+# @st.cache_data 가 돌려준 dict를 그대로 쓰면 아래 집세 덮어쓰기가 캐시 자체를
+# 오염시킨다(다음 rerun·다른 세션까지 전파). 반드시 사본으로 작업한다.
 if current_model == "🤖 시계열 모델(SARIMA)":
-    rec_values = sarima_preds
+    rec_values = dict(sarima_preds)
 else:
-    rec_values = seasonal_preds
+    rec_values = dict(seasonal_preds)
+
+HOUSING_BASE_SOURCE = "SARIMA" if current_model.startswith("🤖") else "3개년 동월 평균"
+HOUSING_BASE_MOM = float(rec_values['집세'])
+HOUSING_SOURCE = HOUSING_BASE_SOURCE
+if kb_housing is not None:
+    rec_values['집세'] = float(kb_housing["mom"])
+    HOUSING_SOURCE = "KB 전세지수"
 
 # 최초 세션 세팅 (새로운 한글 대분류 반영)
 # 변동성 품목 기본값 = 실시간 시세에서 산출한 MoM (수집 실패 시 0.0)
@@ -815,6 +882,16 @@ if st.session_state.prev_model != current_model:
     st.session_state.prev_model = current_model
     st.session_state["tab2_methodology"] = current_model
     st.rerun()
+
+# 집세 추천값 출처(SARIMA <-> KB) 변경감지
+# KB 토글을 켜거나 끄면 집세 입력값만 새 추천값으로 되돌린다. 다른 품목과
+# 사용자가 수기 조정한 값은 건드리지 않는다.
+if "prev_housing_source" not in st.session_state:
+    st.session_state.prev_housing_source = HOUSING_SOURCE
+
+if st.session_state.prev_housing_source != HOUSING_SOURCE:
+    st.session_state.housing_val = float(rec_values['집세'])
+    st.session_state.prev_housing_source = HOUSING_SOURCE
 
 if "tab2_methodology" not in st.session_state:
     st.session_state["tab2_methodology"] = current_model
@@ -1090,7 +1167,58 @@ with tab2:
     with col_right:
         st.subheader("📈 2. 추세적 품목 예상치")
         st.markdown(f"*(초기값 세팅 기준: **{current_model}**)*")
-        
+
+        # ---- 집세: KB 주간 전세지수 반영 (옵션 / 버튼 클릭 시에만 연산) ----
+        # 이 블록은 아래 housing_val 위젯보다 먼저 렌더돼야 한다. Streamlit은
+        # 위젯이 인스턴스화된 뒤 그 key의 session_state 를 바꾸면 예외를 던진다.
+        kb_on = bool(st.session_state.get("use_kb_housing", False))
+        if KB_HOUSING_AVAILABLE:
+            kb_btn_col, kb_again_col = st.columns([1.6, 1])
+            with kb_btn_col:
+                if st.button("🏠 KB 전세지수 반영" if not kb_on else "↩️ SARIMA로 되돌리기",
+                             use_container_width=True,
+                             type="primary" if not kb_on else "secondary",
+                             key="toggle_kb_housing",
+                             help="집세 추천값만 KB 주간 전세지수 기반 모형으로 교체합니다. "
+                                  "34개월 검증 MAE 0.02129 → 0.01822 (지수포인트)"):
+                    st.session_state["use_kb_housing"] = not kb_on
+                    st.rerun()
+            with kb_again_col:
+                if kb_on and st.button("🔁 다시 계산", use_container_width=True,
+                                       key="refresh_kb_housing",
+                                       help="1시간 캐시를 무시하고 다시 계산합니다."):
+                    fetch_kb_housing.clear()
+                    st.rerun()
+
+            if kb_housing is not None:
+                st.caption(
+                    f"집세: {HOUSING_BASE_SOURCE} {HOUSING_BASE_MOM:+.3f}% → "
+                    f"**KB {kb_housing['mom']:+.3f}%** "
+                    f"(KB 제외 릿지 {kb_housing['mom_cpi_only']:+.3f}%) · "
+                    f"앵커 {kb_housing['anchor_month']:%Y-%m} {kb_housing['anchor']:.2f} · "
+                    f"학습 {kb_housing['train_count']}개월")
+                stale_txt = (f"KB 기준주 {kb_housing['kb_latest']:%Y-%m-%d} "
+                             f"({kb_housing['kb_stale_weeks']:.0f}주 경과 · 당월 공개 "
+                             f"{kb_housing['kb_available_weeks']}주 / 외삽 "
+                             f"{kb_housing['kb_forecast_weeks']}주)")
+                if kb_housing.get("stale_warn"):
+                    st.warning(f"⚠️ {stale_txt} — {rent_cpi_kb.STALE_WARN_WEEKS}주를 넘었습니다. "
+                               "새 kb.db로 교체 후 extract_kb_jeonse.py 를 실행하세요.")
+                else:
+                    st.caption(stale_txt)
+                if not kb_housing.get("release_calendar_covers_target", True):
+                    st.caption(f"ℹ️ {kb_housing['target_month']:%Y}년 CPI 발표일정이 "
+                               "rent_cpi_kb.CPI_RELEASE_CALENDAR 에 없어 '익월 7일' 가정을 "
+                               "씁니다. 실제 공표일로 채우면 정보집합이 정확해집니다.")
+            elif kb_on:
+                st.error(f"⚠️ KB 집세 예측 실패 → {HOUSING_BASE_SOURCE} 값을 유지합니다. "
+                         f"{kb_housing_err or ''}")
+        elif not KB_HOUSING_OK:
+            st.caption(f"🏠 KB 전세지수 옵션 사용 불가 — 모듈 로드 실패: {KB_HOUSING_IMPORT_ERR}")
+        else:
+            st.caption("🏠 KB 전세지수 옵션 사용 불가 — `kb_jeonse.csv` 가 없습니다. "
+                       "`python extract_kb_jeonse.py --kb-db \"경로/kb.db\"` 로 생성하세요.")
+
         mom_processed = st.number_input(
             f"가공식품 예상 (MoM %, 추천: {rec_values.get('가공식품', 0.0):.3f}%)",
             step=0.001, format="%.3f", key="processed_val",
@@ -1108,10 +1236,21 @@ with tab2:
             help=f"{format_sarima_order('전기수도가스')} | 외생변수: 없음"
         )
         
+        if kb_housing is not None:
+            housing_label = (f"집세 예상 (MoM %, 추천: {rec_values['집세']:.3f}% · KB)")
+            housing_help = (
+                "KB 주간 전세지수 2단계 모형 — 1단계 미공개주 AR(2) 외삽으로 KB 월평균 추정, "
+                "2단계 CPI 최근변화율 2개 + KB 3개월 평균변화율을 릿지 회귀(λ=5). "
+                f"학습 2019-01~ 확대표본 {kb_housing['train_count']}개월. "
+                f"예측지수 {kb_housing['index']:.3f} (앵커 {kb_housing['anchor']:.2f}). "
+                "34개월 검증 MAE 0.01822 지수포인트.")
+        else:
+            housing_label = f"집세 예상 (MoM %, 추천: {rec_values['집세']:.3f}%)"
+            housing_help = format_sarima_order('집세')
+
         mom_housing = st.number_input(
-            f"집세 예상 (MoM %, 추천: {rec_values['집세']:.3f}%)",
-            step=0.001, format="%.3f", key="housing_val",
-            help=format_sarima_order('집세')
+            housing_label, step=0.001, format="%.3f", key="housing_val",
+            help=housing_help
         )
         mom_public = st.number_input(
             f"공공서비스 예상 (MoM %, 추천: {rec_values['공공서비스']:.3f}%)",
@@ -1128,7 +1267,16 @@ with tab2:
     # 🧮 환율 효과 및 인덱스 예측 연산 시동
     # ------------------------------------------
     pred_indices = compute_tab2_pred_indices(last_row, rec_values, st.session_state)
-    st.caption(f"📌 현재 기준: {current_model}")
+    # 집세 출처를 함께 남긴다. 나중에 결과를 재현할 때 어떤 모형이 쓰였는지
+    # 캡션만 보고 알 수 있어야 한다.
+    if kb_housing is not None:
+        st.caption(f"📌 현재 기준: {current_model} · 집세는 KB 전세지수 모형 "
+                   f"(KB 기준주 {kb_housing['kb_latest']:%Y-%m-%d})")
+        st.session_state["tab2_methodology"] = (
+            f"{current_model} + 집세 KB({kb_housing['kb_latest']:%Y-%m-%d})")
+    else:
+        st.caption(f"📌 현재 기준: {current_model}")
+        st.session_state["tab2_methodology"] = current_model
         
 
     # 가중치 합산 기반 총지수 도출
