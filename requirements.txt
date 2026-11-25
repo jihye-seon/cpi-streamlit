@@ -1,10 +1,8 @@
-streamlit==1.58.0
-pandas==2.3.1
-numpy==2.3.2
-plotly==6.8.0
-statsmodels==0.14.5
-openpyxl==3.1.5
-requests==2.32.4
-urllib3==2.5.0
-# pandas.read_html 백엔드 — 없으면 KAMIS/EKAPE 파싱이 런타임에 실패한다
-lxml==6.1.1
+streamlit
+pandas
+numpy
+plotly
+statsmodels
+openpyxl
+requests
+lxml
